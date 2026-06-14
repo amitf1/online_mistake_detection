@@ -1,0 +1,11 @@
+torch
+transformers
+qwen-vl-utils
+opencv-python
+numpy
+tqdm
+datasets
+unsloth
+trl
+bitsandbytes
+accelerate
