@@ -9,3 +9,4 @@ unsloth
 trl
 bitsandbytes
 accelerate
+tensorboard

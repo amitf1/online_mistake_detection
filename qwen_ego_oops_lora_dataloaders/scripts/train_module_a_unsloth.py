@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.001)
     parser.add_argument("--lr-scheduler-type", default="linear")
     parser.add_argument("--seed", type=int, default=3407)
-    parser.add_argument("--report-to", default="none")
+    parser.add_argument("--report-to", default="tensorboard")
     parser.add_argument("--dataset-num-proc", type=int, default=1)
 
     # Validation / execution mode

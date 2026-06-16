@@ -54,6 +54,12 @@ python scripts/train_module_a_unsloth.py \
   --output-dir /nvcr/users/afeldman/omd/module_a_qwen35_2b_smoke
 ```
 
+TensorBoard logging is enabled by default. To watch loss curves:
+
+```bash
+tensorboard --logdir /nvcr/users/afeldman/omd/module_a_qwen35_2b_smoke
+```
+
 To try the 4B model after the pipeline is stable, override the defaults:
 
 ```bash
