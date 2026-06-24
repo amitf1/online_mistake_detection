@@ -77,13 +77,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.001)
     parser.add_argument("--lr-scheduler-type", default="linear")
     parser.add_argument("--seed", type=int, default=3407)
-    parser.add_argument("--report-to", default="tensorboard")
+    parser.add_argument(
+        "--report-to",
+        default="tensorboard",
+        help="Comma-separated Trainer loggers, for example: tensorboard,wandb.",
+    )
     parser.add_argument("--dataset-num-proc", type=int, default=1)
 
     # Validation / execution mode
     parser.add_argument("--dry-run", action="store_true", help="Build dataset and print examples only.")
     parser.add_argument("--print-examples", type=int, default=1)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.report_to = [item.strip() for item in args.report_to.split(",") if item.strip()]
+    return args
 
 
 def is_bf16_available() -> bool:
@@ -123,7 +129,12 @@ def training_example_to_conversation(example: TrainingExample, *, fps: float) ->
         "messages": [
             {
                 "role": "system",
-                "content": MODULE_A_SYSTEM_PROMPT,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": MODULE_A_SYSTEM_PROMPT,
+                    }
+                ],
             },
             {
                 "role": "user",
@@ -141,7 +152,12 @@ def training_example_to_conversation(example: TrainingExample, *, fps: float) ->
             },
             {
                 "role": "assistant",
-                "content": example.target_text,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": example.target_text,
+                    }
+                ],
             },
         ],
         "video_id": example.video_id,

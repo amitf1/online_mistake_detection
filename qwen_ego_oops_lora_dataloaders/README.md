@@ -13,10 +13,14 @@ normalization contract.
 
 ## Install
 
+See `INSTALL.md` for both Docker and local venv setup.
+
 ```bash
 cd /nvcr/users/afeldman/experiments/online_mistake_detection/qwen_ego_oops_lora_dataloaders
 python -m venv .venv
 source .venv/bin/activate
+pip install "torch>=2.10.0,<2.11.0" torchvision --index-url https://download.pytorch.org/whl/cu128
+pip install unsloth==2026.6.7 unsloth_zoo==2026.6.5 --no-deps
 pip install -r requirements.txt
 pip install -e .
 ```
