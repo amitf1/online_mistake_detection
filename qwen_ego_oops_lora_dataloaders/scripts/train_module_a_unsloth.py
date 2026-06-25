@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import copy
+import datetime as dt
 import inspect
 import json
 import math
+import random
+import shutil
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +29,9 @@ from qwen_omd_dataloaders.schema import TrainingExample  # noqa: E402
 
 MODULE_A_SYSTEM_PROMPT = "You are an online procedural step completion detector."
 DEFAULT_OUTPUT_DIR = "/nvcr/users/afeldman/omd/module_a_qwen35_2b_lora"
+MODULE_A_SPLIT_VERSION = 1
+MODULE_A_LABELS = ("[WAIT]", "[COMPLETE]")
+MODULE_A_POSITIVE_LABEL = "[COMPLETE]"
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,10 +81,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--warmup-steps", type=int, default=10)
+    parser.add_argument(
+        "--train-mode",
+        choices=("steps", "epochs"),
+        default="steps",
+        help="Cap training by optimizer steps or by epochs.",
+    )
     parser.add_argument("--max-steps", type=int, default=100)
-    parser.add_argument("--num-train-epochs", type=float, default=None)
+    parser.add_argument("--num-train-epochs", type=float, default=3.0)
     parser.add_argument("--logging-steps", type=int, default=1)
     parser.add_argument("--save-steps", type=int, default=50)
+    parser.add_argument(
+        "--checkpoint-epochs",
+        type=int,
+        default=2,
+        help="Save rolling ckpt_epN checkpoints every N completed epochs.",
+    )
+    parser.add_argument(
+        "--save-strategy",
+        choices=("steps", "epoch"),
+        default="steps",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument("--optim", default="adamw_8bit")
     parser.add_argument("--weight-decay", type=float, default=0.001)
@@ -92,10 +116,70 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-num-proc", type=int, default=1)
 
     # Validation / execution mode
+    parser.add_argument(
+        "--split-file",
+        default=None,
+        help="JSON file with train/validation video IDs. Created if missing.",
+    )
+    parser.add_argument(
+        "--regenerate-split",
+        action="store_true",
+        help="Overwrite an existing split file using the configured split policy.",
+    )
+    parser.add_argument("--val-fraction", type=float, default=0.2)
+    parser.add_argument(
+        "--val-videos-per-task",
+        type=int,
+        default=2,
+        help="Validation videos per task for the default 50-video corpus.",
+    )
+    parser.add_argument("--eval-steps", type=int, default=50)
+    parser.add_argument(
+        "--eval-epochs",
+        type=int,
+        default=2,
+        help="Run validation every N completed epochs.",
+    )
+    parser.add_argument(
+        "--eval-strategy",
+        choices=("steps", "epoch"),
+        default="steps",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--per-device-eval-batch-size", type=int, default=1)
+    parser.add_argument("--eval-generation-max-samples", type=int, default=50)
+    parser.add_argument("--eval-generation-max-new-tokens", type=int, default=8)
+    parser.add_argument("--early-stopping-patience", type=int, default=3)
+    parser.add_argument("--early-stopping-threshold", type=float, default=0.0)
+    parser.add_argument("--metric-for-best-model", default="eval_loss")
+    parser.add_argument("--greater-is-better", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--keep-last-checkpoints", type=int, default=4)
+    parser.add_argument("--keep-best-checkpoints", type=int, default=4)
+    parser.add_argument("--save-total-limit", type=int, default=3, help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true", help="Build dataset and print examples only.")
     parser.add_argument("--print-examples", type=int, default=1)
     args = parser.parse_args()
     args.report_to = [item.strip() for item in args.report_to.split(",") if item.strip()]
+    if args.train_mode == "steps" and args.max_steps <= 0:
+        parser.error("--max-steps must be positive when --train-mode=steps.")
+    if args.train_mode == "epochs" and args.num_train_epochs <= 0:
+        parser.error("--num-train-epochs must be positive when --train-mode=epochs.")
+    if not 0.0 < args.val_fraction < 1.0:
+        parser.error("--val-fraction must be between 0 and 1.")
+    if args.val_videos_per_task < 1:
+        parser.error("--val-videos-per-task must be positive.")
+    if args.eval_steps < 1:
+        parser.error("--eval-steps must be positive.")
+    if args.eval_epochs < 1:
+        parser.error("--eval-epochs must be positive.")
+    if args.checkpoint_epochs < 1:
+        parser.error("--checkpoint-epochs must be positive.")
+    if args.keep_last_checkpoints < 0:
+        parser.error("--keep-last-checkpoints cannot be negative.")
+    if args.keep_best_checkpoints < 0:
+        parser.error("--keep-best-checkpoints cannot be negative.")
+    if args.greater_is_better is None:
+        args.greater_is_better = not args.metric_for_best_model.endswith("loss")
     return args
 
 
@@ -146,6 +230,136 @@ def build_module_a_dataset(args: argparse.Namespace) -> EgoOopsModuleADataset:
         seed=args.seed,
     )
     return EgoOopsModuleADataset(provider, config=config)
+
+
+def default_split_file(args: argparse.Namespace) -> Path:
+    return PROJECT_ROOT / "splits" / f"module_a_video_split_seed{args.seed}.json"
+
+
+def grouped_video_ids(dataset: EgoOopsModuleADataset) -> dict[str, list[str]]:
+    grouped: dict[str, set[str]] = defaultdict(set)
+    for record in dataset.records:
+        grouped[record.task_id].add(record.video_id)
+    return {
+        task_id: sorted(video_ids)
+        for task_id, video_ids in sorted(grouped.items())
+    }
+
+
+def split_policy(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "type": "per_task_video_holdout",
+        "val_fraction": args.val_fraction,
+        "val_videos_per_task": args.val_videos_per_task,
+    }
+
+
+def data_config_for_split(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "max_videos": args.max_videos,
+        "task_ids": sorted(args.task_ids or []),
+        "video_ids": sorted(args.video_ids or []),
+        "stride_seconds": args.stride_seconds,
+        "completion_margin": args.completion_margin,
+        "negative_to_positive_ratio": args.negative_to_positive_ratio,
+        "keep_last_wait_windows": args.keep_last_wait_windows,
+    }
+
+
+def make_video_split(dataset: EgoOopsModuleADataset, args: argparse.Namespace) -> dict[str, Any]:
+    grouped = grouped_video_ids(dataset)
+    if not grouped:
+        raise ValueError("Cannot create a split from an empty dataset.")
+
+    rng = random.Random(args.seed)
+    tasks: dict[str, dict[str, list[str]]] = {}
+    train_video_ids: list[str] = []
+    val_video_ids: list[str] = []
+    for task_id, video_ids in grouped.items():
+        shuffled = list(video_ids)
+        rng.shuffle(shuffled)
+        if len(shuffled) < 2:
+            raise ValueError(f"Task {task_id!r} has too few videos for validation splitting.")
+        val_count = min(args.val_videos_per_task, len(shuffled) - 1)
+        if len(grouped) != 5 or len(shuffled) != 10:
+            val_count = max(1, round(len(shuffled) * args.val_fraction))
+            val_count = min(val_count, len(shuffled) - 1)
+        val = sorted(shuffled[:val_count])
+        train = sorted(shuffled[val_count:])
+        tasks[task_id] = {"train": train, "val": val}
+        train_video_ids.extend(train)
+        val_video_ids.extend(val)
+
+    return {
+        "version": MODULE_A_SPLIT_VERSION,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "seed": args.seed,
+        "split_policy": split_policy(args),
+        "metadata_path": str(Path(args.metadata).resolve()),
+        "video_root": str(Path(args.video_root).resolve()),
+        "data_config": data_config_for_split(args),
+        "train_video_ids": sorted(train_video_ids),
+        "val_video_ids": sorted(val_video_ids),
+        "tasks": tasks,
+    }
+
+
+def validate_video_split(split: dict[str, Any], dataset: EgoOopsModuleADataset) -> None:
+    train_ids = set(split.get("train_video_ids", []))
+    val_ids = set(split.get("val_video_ids", []))
+    if not train_ids or not val_ids:
+        raise ValueError("Split file must contain non-empty train_video_ids and val_video_ids.")
+    overlap = train_ids & val_ids
+    if overlap:
+        raise ValueError(f"Split file has overlapping train/val video IDs: {sorted(overlap)}")
+
+    available = {record.video_id for record in dataset.records}
+    missing = (train_ids | val_ids) - available
+    if missing:
+        raise ValueError(f"Split file references videos not in the selected dataset: {sorted(missing)}")
+
+    grouped = grouped_video_ids(dataset)
+    for task_id, task_split in split.get("tasks", {}).items():
+        if task_id not in grouped:
+            raise ValueError(f"Split file references missing task: {task_id}")
+        task_ids = set(task_split.get("train", [])) | set(task_split.get("val", []))
+        outside_task = task_ids - set(grouped[task_id])
+        if outside_task:
+            raise ValueError(
+                f"Split file places videos under the wrong task {task_id!r}: {sorted(outside_task)}"
+            )
+
+
+def load_or_create_video_split(dataset: EgoOopsModuleADataset, args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
+    split_path = Path(args.split_file) if args.split_file else default_split_file(args)
+    if split_path.exists() and not args.regenerate_split:
+        with open(split_path, "r", encoding="utf-8") as file:
+            split = json.load(file)
+        validate_video_split(split, dataset)
+        print(f"Loaded Module A split from: {split_path}")
+        return split, split_path
+
+    split = make_video_split(dataset, args)
+    validate_video_split(split, dataset)
+    split_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(split_path, "w", encoding="utf-8") as file:
+        json.dump(split, file, indent=2, sort_keys=True)
+        file.write("\n")
+    print(f"Wrote Module A split to: {split_path}")
+    return split, split_path
+
+
+def split_conversations(
+    conversations: list[dict[str, Any]],
+    split: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    train_ids = set(split["train_video_ids"])
+    val_ids = set(split["val_video_ids"])
+    train = [item for item in conversations if item["video_id"] in train_ids]
+    val = [item for item in conversations if item["video_id"] in val_ids]
+    if not train or not val:
+        raise ValueError("Train/validation split produced an empty conversation split.")
+    return train, val
 
 
 def to_unsloth_conversations(
@@ -231,10 +445,50 @@ def summarize_module_a(dataset: EgoOopsModuleADataset) -> dict[str, Any]:
     }
 
 
-def print_dry_run(dataset: EgoOopsModuleADataset, conversations: list[dict[str, Any]], limit: int) -> None:
-    print("Module A dataset summary:")
+def summarize_conversations(conversations: list[dict[str, Any]]) -> dict[str, Any]:
+    label_counts = Counter(str(item["target"]) for item in conversations)
+    videos_by_task: dict[str, set[str]] = defaultdict(set)
+    examples_by_task = Counter()
+    for item in conversations:
+        task_id = str(item["task_id"])
+        videos_by_task[task_id].add(str(item["video_id"]))
+        examples_by_task[task_id] += 1
+    return {
+        "num_examples": len(conversations),
+        "num_videos": len({item["video_id"] for item in conversations}),
+        "label_counts": dict(sorted(label_counts.items())),
+        "tasks": {
+            task_id: {
+                "num_videos": len(video_ids),
+                "num_examples": examples_by_task[task_id],
+            }
+            for task_id, video_ids in sorted(videos_by_task.items())
+        },
+    }
+
+
+def print_dry_run(
+    dataset: EgoOopsModuleADataset,
+    train_conversations: list[dict[str, Any]],
+    val_conversations: list[dict[str, Any]],
+    split: dict[str, Any],
+    split_path: Path,
+    limit: int,
+) -> None:
+    print("Module A full dataset summary:")
     print(json.dumps(summarize_module_a(dataset), indent=2, ensure_ascii=False))
-    for index, conversation in enumerate(conversations[: max(0, limit)]):
+    print(f"Module A split file: {split_path}")
+    print("Module A split video summary:")
+    print(json.dumps({
+        "train_video_ids": split["train_video_ids"],
+        "val_video_ids": split["val_video_ids"],
+        "tasks": split["tasks"],
+    }, indent=2, ensure_ascii=False))
+    print("Module A train summary:")
+    print(json.dumps(summarize_conversations(train_conversations), indent=2, ensure_ascii=False))
+    print("Module A validation summary:")
+    print(json.dumps(summarize_conversations(val_conversations), indent=2, ensure_ascii=False))
+    for index, conversation in enumerate(train_conversations[: max(0, limit)]):
         print(f"\nExample {index}:")
         print(json.dumps(conversation, indent=2, ensure_ascii=False))
 
@@ -256,6 +510,10 @@ def save_run_config(
     args: argparse.Namespace,
     dataset: EgoOopsModuleADataset,
     conversations: list[dict[str, Any]],
+    train_conversations: list[dict[str, Any]],
+    val_conversations: list[dict[str, Any]],
+    split: dict[str, Any],
+    split_path: Path,
 ) -> None:
     output_path = Path(args.output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -263,12 +521,77 @@ def save_run_config(
         "args": json_safe(vars(args)),
         "dataset_summary": summarize_module_a(dataset),
         "num_conversations": len(conversations),
+        "split_file": str(split_path),
+        "split": json_safe(split),
+        "train_summary": summarize_conversations(train_conversations),
+        "validation_summary": summarize_conversations(val_conversations),
     }
     config_path = output_path / "run_config.json"
     with open(config_path, "w", encoding="utf-8") as file:
         json.dump(run_config, file, indent=2, sort_keys=True, ensure_ascii=False)
         file.write("\n")
     print(f"Saved run config to: {config_path}")
+
+
+def label_to_positive(label: str) -> bool:
+    return label.strip() == MODULE_A_POSITIVE_LABEL
+
+
+def binary_detection_metrics(
+    targets: list[str],
+    predictions: list[str],
+    *,
+    prefix: str,
+) -> dict[str, float]:
+    tp = fp = tn = fn = 0
+    for target, prediction in zip(targets, predictions):
+        target_positive = label_to_positive(target)
+        predicted_positive = label_to_positive(prediction)
+        if target_positive and predicted_positive:
+            tp += 1
+        elif not target_positive and predicted_positive:
+            fp += 1
+        elif not target_positive and not predicted_positive:
+            tn += 1
+        else:
+            fn += 1
+
+    total = tp + fp + tn + fn
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    specificity = tn / (tn + fp) if tn + fp else 0.0
+    accuracy = (tp + tn) / total if total else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    balanced_accuracy = (recall + specificity) / 2.0
+    denominator = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    mcc = ((tp * tn) - (fp * fn)) / denominator if denominator else 0.0
+
+    return {
+        f"{prefix}/accuracy": accuracy,
+        f"{prefix}/precision": precision,
+        f"{prefix}/recall": recall,
+        f"{prefix}/f1": f1,
+        f"{prefix}/specificity": specificity,
+        f"{prefix}/balanced_accuracy": balanced_accuracy,
+        f"{prefix}/mcc": mcc,
+        f"{prefix}/tp": float(tp),
+        f"{prefix}/fp": float(fp),
+        f"{prefix}/tn": float(tn),
+        f"{prefix}/fn": float(fn),
+        f"{prefix}/num_samples": float(total),
+    }
+
+
+def extract_module_a_label(text: str) -> str:
+    for label in MODULE_A_LABELS:
+        if label in text:
+            return label
+    normalized = text.strip().upper()
+    if "COMPLETE" in normalized:
+        return "[COMPLETE]"
+    if "WAIT" in normalized:
+        return "[WAIT]"
+    return "[WAIT]"
 
 
 def load_unsloth_model(args: argparse.Namespace) -> tuple[Any, Any]:
@@ -454,28 +777,340 @@ class Qwen3VLMetadataVisionDataCollator:
         return batch
 
 
+class ModuleADetectionMetricsCallback:
+    def __init__(
+        self,
+        *,
+        eval_examples: list[dict[str, Any]],
+        data_collator: Qwen3VLMetadataVisionDataCollator,
+        tokenizer: Any,
+        max_samples: int,
+        max_new_tokens: int,
+    ) -> None:
+        from transformers import TrainerCallback
+
+        self._callback_base = TrainerCallback()
+        self.trainer: Any | None = None
+        self.eval_examples = eval_examples[: max(0, max_samples)]
+        self.data_collator = data_collator
+        self.tokenizer = tokenizer
+        self.max_new_tokens = max_new_tokens
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._callback_base, name)
+
+    def on_evaluate(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        if self.trainer is None or not self.eval_examples:
+            return control
+
+        model = kwargs["model"]
+        was_training = model.training
+        predictions: list[str] = []
+        targets: list[str] = []
+        task_targets: dict[str, list[str]] = defaultdict(list)
+        task_predictions: dict[str, list[str]] = defaultdict(list)
+
+        import torch
+        from unsloth import FastVisionModel
+
+        FastVisionModel.for_inference(model)
+        try:
+            with torch.inference_mode():
+                for example in self.eval_examples:
+                    generated_text = self._generate_label(model, example)
+                    prediction = extract_module_a_label(generated_text)
+                    target = str(example["target"])
+                    task_id = str(example["task_id"])
+                    predictions.append(prediction)
+                    targets.append(target)
+                    task_predictions[task_id].append(prediction)
+                    task_targets[task_id].append(target)
+        finally:
+            if was_training:
+                FastVisionModel.for_training(model)
+
+        metrics = binary_detection_metrics(targets, predictions, prefix="eval_detection")
+        for task_id in sorted(task_targets):
+            task_metrics = binary_detection_metrics(
+                task_targets[task_id],
+                task_predictions[task_id],
+                prefix=f"eval_detection/task_{task_id}",
+            )
+            metrics.update({
+                key: value
+                for key, value in task_metrics.items()
+                if key.endswith(("/accuracy", "/f1", "/recall", "/num_samples"))
+            })
+        callback_metrics = kwargs.get("metrics")
+        if isinstance(callback_metrics, dict):
+            callback_metrics.update(metrics)
+        self.trainer.log(metrics)
+        return control
+
+    def _generation_inputs(self, example: dict[str, Any]) -> dict[str, Any]:
+        messages = [
+            copy.deepcopy(message)
+            for message in example["messages"]
+            if message.get("role") != "assistant"
+        ]
+        text = self.data_collator._base.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        image, video, video_kwargs, video_metadata = self.data_collator._extract_images_videos_metadata(messages)
+        proc_kwargs: dict[str, Any] = {
+            "text": [text],
+            "padding": True,
+            "return_tensors": "pt",
+            "add_special_tokens": False,
+        }
+        if image:
+            proc_kwargs["images"] = image
+        if video:
+            proc_kwargs["videos"] = video
+            proc_kwargs["do_resize"] = False
+            proc_kwargs.update(video_kwargs)
+            if video_metadata:
+                proc_kwargs["video_metadata"] = video_metadata
+        return self.data_collator._base.processor(**proc_kwargs)
+
+    def _generate_label(self, model: Any, example: dict[str, Any]) -> str:
+        inputs = self._generation_inputs(example)
+        device = next(model.parameters()).device
+        inputs = {
+            key: value.to(device) if hasattr(value, "to") else value
+            for key, value in inputs.items()
+        }
+        input_length = inputs["input_ids"].shape[-1]
+        generate_kwargs = {
+            "max_new_tokens": self.max_new_tokens,
+            "do_sample": False,
+        }
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is not None:
+            generate_kwargs["pad_token_id"] = pad_token_id
+        output_ids = model.generate(**inputs, **generate_kwargs)
+        generated_ids = output_ids[:, input_length:]
+        return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=False)[0]
+
+
+class EpochCheckpointCallback:
+    def __init__(
+        self,
+        *,
+        output_dir: str | Path,
+        eval_epochs: int,
+        checkpoint_epochs: int,
+        metric_for_best_model: str,
+        greater_is_better: bool,
+        keep_last_checkpoints: int,
+        keep_best_checkpoints: int,
+        early_stopping_patience: int,
+        early_stopping_threshold: float,
+    ) -> None:
+        from transformers import TrainerCallback
+
+        self._callback_base = TrainerCallback()
+        self.trainer: Any | None = None
+        self.output_dir = Path(output_dir)
+        self.eval_epochs = eval_epochs
+        self.checkpoint_epochs = checkpoint_epochs
+        self.metric_for_best_model = metric_for_best_model
+        self.greater_is_better = greater_is_better
+        self.keep_last_checkpoints = keep_last_checkpoints
+        self.keep_best_checkpoints = keep_best_checkpoints
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_threshold = early_stopping_threshold
+        self.best_metric: float | None = None
+        self.no_improvement_count = 0
+        self.best_records: list[dict[str, Any]] = []
+        self._last_latest_epoch: int | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._callback_base, name)
+
+    def on_epoch_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        epoch = self._completed_epoch(state)
+        if epoch is None:
+            return control
+
+        self._save_named_checkpoint("latest")
+        self._last_latest_epoch = epoch
+
+        if epoch % self.checkpoint_epochs == 0:
+            self._save_named_checkpoint(f"ckpt_ep{epoch}")
+            self._prune_epoch_checkpoints("ckpt_ep", self.keep_last_checkpoints)
+
+        if epoch % self.eval_epochs == 0:
+            control.should_evaluate = True
+        return control
+
+    def on_evaluate(self, args: Any, state: Any, control: Any, metrics: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        if not metrics:
+            return control
+        metric = self._metric_value(metrics)
+        if metric is None:
+            print(f"Metric {self.metric_for_best_model!r} was not found; skipping best checkpoint update.")
+            return control
+
+        epoch = self._epoch_label(state)
+        if self._is_improvement(metric):
+            self.best_metric = metric
+            self.no_improvement_count = 0
+            path = self._save_named_checkpoint(f"best_ep{epoch}")
+            self.best_records.append({
+                "epoch": epoch,
+                "metric": metric,
+                "path": str(path),
+                "global_step": state.global_step,
+            })
+            self._prune_best_checkpoints()
+            self._write_best_manifest()
+        else:
+            self.no_improvement_count += 1
+            if (
+                self.early_stopping_patience > 0
+                and self.no_improvement_count >= self.early_stopping_patience
+            ):
+                print(
+                    "Early stopping: "
+                    f"{self.no_improvement_count} validation checks without improvement in "
+                    f"{self.metric_for_best_model}."
+                )
+                control.should_training_stop = True
+        return control
+
+    def on_train_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        epoch = self._completed_epoch(state)
+        if epoch is None or epoch != self._last_latest_epoch:
+            self._save_named_checkpoint("latest")
+        return control
+
+    def _completed_epoch(self, state: Any) -> int | None:
+        if state.epoch is None:
+            return None
+        rounded = round(float(state.epoch))
+        if rounded < 1 or not math.isclose(float(state.epoch), rounded, abs_tol=1e-3):
+            return None
+        return int(rounded)
+
+    def _epoch_label(self, state: Any) -> str:
+        completed = self._completed_epoch(state)
+        if completed is not None:
+            return str(completed)
+        if state.epoch is None:
+            return f"step{state.global_step}"
+        return str(float(state.epoch)).replace(".", "_")
+
+    def _metric_value(self, metrics: dict[str, Any]) -> float | None:
+        keys = [
+            self.metric_for_best_model,
+            f"eval_{self.metric_for_best_model}",
+        ]
+        for key in keys:
+            if key in metrics:
+                try:
+                    return float(metrics[key])
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _is_improvement(self, metric: float) -> bool:
+        if self.best_metric is None:
+            return True
+        if self.greater_is_better:
+            return metric > self.best_metric + self.early_stopping_threshold
+        return metric < self.best_metric - self.early_stopping_threshold
+
+    def _save_named_checkpoint(self, name: str) -> Path:
+        if self.trainer is None:
+            raise RuntimeError("EpochCheckpointCallback.trainer must be assigned before training.")
+        path = self.output_dir / name
+        if path.exists():
+            shutil.rmtree(path)
+        path.mkdir(parents=True, exist_ok=True)
+        self.trainer.save_model(path)
+        self.trainer.state.save_to_json(str(path / "trainer_state.json"))
+        return path
+
+    def _prune_epoch_checkpoints(self, prefix: str, keep: int) -> None:
+        if keep == 0:
+            candidates = list(self.output_dir.glob(f"{prefix}*"))
+        else:
+            candidates = sorted(
+                self.output_dir.glob(f"{prefix}*"),
+                key=lambda path: self._epoch_from_name(path.name, prefix),
+            )[:-keep]
+        for path in candidates:
+            if path.is_dir():
+                shutil.rmtree(path)
+
+    def _prune_best_checkpoints(self) -> None:
+        if self.keep_best_checkpoints == 0:
+            records_to_remove = list(self.best_records)
+            self.best_records = []
+        else:
+            reverse = self.greater_is_better
+            self.best_records.sort(key=lambda item: item["metric"], reverse=reverse)
+            records_to_remove = self.best_records[self.keep_best_checkpoints :]
+            self.best_records = self.best_records[: self.keep_best_checkpoints]
+        for record in records_to_remove:
+            path = Path(record["path"])
+            if path.is_dir():
+                shutil.rmtree(path)
+
+    def _write_best_manifest(self) -> None:
+        manifest = {
+            "metric_for_best_model": self.metric_for_best_model,
+            "greater_is_better": self.greater_is_better,
+            "best_metric": self.best_metric,
+            "best_checkpoints": self.best_records,
+        }
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.output_dir / "best_checkpoints.json", "w", encoding="utf-8") as file:
+            json.dump(manifest, file, indent=2, sort_keys=True)
+            file.write("\n")
+
+    @staticmethod
+    def _epoch_from_name(name: str, prefix: str) -> int:
+        try:
+            return int(name.removeprefix(prefix))
+        except ValueError:
+            return -1
+
+
 def build_trainer(
     *,
     model: Any,
     tokenizer: Any,
     train_dataset: list[dict[str, Any]],
+    eval_dataset: list[dict[str, Any]],
     args: argparse.Namespace,
 ) -> Any:
     from datasets import Dataset
+    from transformers import TrainerCallback
     from trl import SFTConfig, SFTTrainer
     from unsloth import FastVisionModel
 
     FastVisionModel.for_training(model)
     bf16 = is_bf16_available()
     hf_train_dataset = Dataset.from_list(train_dataset)
+    hf_eval_dataset = Dataset.from_list(eval_dataset)
+    callbacks: list[TrainerCallback] = []
     trainer_args = dict(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         warmup_steps=args.warmup_steps,
         learning_rate=args.learning_rate,
         logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
+        eval_strategy="no",
+        save_strategy="no",
+        load_best_model_at_end=False,
+        metric_for_best_model=args.metric_for_best_model,
+        greater_is_better=args.greater_is_better,
         optim=args.optim,
         weight_decay=args.weight_decay,
         lr_scheduler_type=args.lr_scheduler_type,
@@ -489,27 +1124,53 @@ def build_trainer(
         dataset_text_field="",
         dataset_kwargs={"skip_prepare_dataset": True},
     )
-    if args.num_train_epochs is not None:
+    if args.train_mode == "epochs":
         trainer_args["num_train_epochs"] = args.num_train_epochs
     else:
         trainer_args["max_steps"] = args.max_steps
 
-    return SFTTrainer(
+    data_collator = Qwen3VLMetadataVisionDataCollator(
+        model,
+        tokenizer,
+        max_seq_length=args.max_seq_length,
+        resize=args.vision_resize,
+        train_on_responses_only=True,
+        instruction_part="<|im_start|>user\n",
+        response_part="<|im_start|>assistant\n",
+        completion_only_loss=True,
+    )
+    detection_callback = ModuleADetectionMetricsCallback(
+        eval_examples=eval_dataset,
+        data_collator=data_collator,
+        tokenizer=tokenizer,
+        max_samples=args.eval_generation_max_samples,
+        max_new_tokens=args.eval_generation_max_new_tokens,
+    )
+    callbacks.append(detection_callback)
+    checkpoint_callback = EpochCheckpointCallback(
+        output_dir=args.output_dir,
+        eval_epochs=args.eval_epochs,
+        checkpoint_epochs=args.checkpoint_epochs,
+        metric_for_best_model=args.metric_for_best_model,
+        greater_is_better=args.greater_is_better,
+        keep_last_checkpoints=args.keep_last_checkpoints,
+        keep_best_checkpoints=args.keep_best_checkpoints,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_threshold=args.early_stopping_threshold,
+    )
+    callbacks.append(checkpoint_callback)
+    trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=hf_train_dataset,
-        data_collator=Qwen3VLMetadataVisionDataCollator(
-            model,
-            tokenizer,
-            max_seq_length=args.max_seq_length,
-            resize=args.vision_resize,
-            train_on_responses_only=True,
-            instruction_part="<|im_start|>user\n",
-            response_part="<|im_start|>assistant\n",
-            completion_only_loss=True,
-        ),
+        eval_dataset=hf_eval_dataset,
+        data_collator=data_collator,
         args=SFTConfig(**trainer_args),
+        callbacks=callbacks,
     )
+    detection_callback.trainer = trainer
+    checkpoint_callback.trainer = trainer
+    return trainer
 
 
 def save_outputs(model: Any, tokenizer: Any, output_dir: str | Path) -> None:
@@ -532,19 +1193,42 @@ def main() -> None:
 
     if not conversations:
         raise SystemExit("Module A dataset produced no conversations.")
-    save_run_config(args=args, dataset=dataset, conversations=conversations)
+    split, split_path = load_or_create_video_split(dataset, args)
+    train_conversations, val_conversations = split_conversations(conversations, split)
+    save_run_config(
+        args=args,
+        dataset=dataset,
+        conversations=conversations,
+        train_conversations=train_conversations,
+        val_conversations=val_conversations,
+        split=split,
+        split_path=split_path,
+    )
     if args.dry_run:
-        print_dry_run(dataset, conversations, args.print_examples)
+        print_dry_run(
+            dataset,
+            train_conversations,
+            val_conversations,
+            split,
+            split_path,
+            args.print_examples,
+        )
         return
 
-    print("Module A dataset summary:")
+    print("Module A full dataset summary:")
     print(json.dumps(summarize_module_a(dataset), indent=2, ensure_ascii=False))
+    print(f"Module A split file: {split_path}")
+    print("Module A train summary:")
+    print(json.dumps(summarize_conversations(train_conversations), indent=2, ensure_ascii=False))
+    print("Module A validation summary:")
+    print(json.dumps(summarize_conversations(val_conversations), indent=2, ensure_ascii=False))
 
     model, tokenizer = load_unsloth_model(args)
     trainer = build_trainer(
         model=model,
         tokenizer=tokenizer,
-        train_dataset=conversations,
+        train_dataset=train_conversations,
+        eval_dataset=val_conversations,
         args=args,
     )
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)

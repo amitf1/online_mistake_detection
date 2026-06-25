@@ -10,8 +10,23 @@ HF_CACHE="${HF_CACHE:-${HOME}/.cache/huggingface}"
 WANDB_DIR="${WANDB_DIR:-${OUTPUT_ROOT}/wandb}"
 REPORT_TO="${REPORT_TO:-tensorboard}"
 MAX_VIDEOS="${MAX_VIDEOS:-50}"
+TRAIN_MODE="${TRAIN_MODE:-steps}"
 MAX_STEPS="${MAX_STEPS:-100}"
-SAVE_STEPS="${SAVE_STEPS:-50}"
+NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-3.0}"
+CHECKPOINT_EPOCHS="${CHECKPOINT_EPOCHS:-2}"
+EVAL_EPOCHS="${EVAL_EPOCHS:-2}"
+KEEP_LAST_CHECKPOINTS="${KEEP_LAST_CHECKPOINTS:-4}"
+KEEP_BEST_CHECKPOINTS="${KEEP_BEST_CHECKPOINTS:-4}"
+VAL_FRACTION="${VAL_FRACTION:-0.2}"
+VAL_VIDEOS_PER_TASK="${VAL_VIDEOS_PER_TASK:-2}"
+SPLIT_FILE="${SPLIT_FILE:-}"
+REGENERATE_SPLIT="${REGENERATE_SPLIT:-false}"
+EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-3}"
+EARLY_STOPPING_THRESHOLD="${EARLY_STOPPING_THRESHOLD:-0.0}"
+METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-eval_loss}"
+GREATER_IS_BETTER="${GREATER_IS_BETTER:-}"
+EVAL_GENERATION_MAX_SAMPLES="${EVAL_GENERATION_MAX_SAMPLES:-50}"
+EVAL_GENERATION_MAX_NEW_TOKENS="${EVAL_GENERATION_MAX_NEW_TOKENS:-8}"
 FPS="${FPS:-1.0}"
 MIN_FRAMES="${MIN_FRAMES:-2}"
 MAX_FRAMES="${MAX_FRAMES:-32}"
@@ -43,11 +58,28 @@ if (( MAX_FRAMES >= 32 && MAX_SEQ_LENGTH < 4096 )); then
   exit 1
 fi
 
+DOCKER_TTY_ARGS=()
+if [[ -t 0 ]]; then
+  DOCKER_TTY_ARGS=(-it)
+fi
+
 TRAIN_ARGS=(
   python scripts/train_module_a_unsloth.py
   --max-videos "${MAX_VIDEOS}"
+  --train-mode "${TRAIN_MODE}"
   --max-steps "${MAX_STEPS}"
-  --save-steps "${SAVE_STEPS}"
+  --num-train-epochs "${NUM_TRAIN_EPOCHS}"
+  --checkpoint-epochs "${CHECKPOINT_EPOCHS}"
+  --eval-epochs "${EVAL_EPOCHS}"
+  --keep-last-checkpoints "${KEEP_LAST_CHECKPOINTS}"
+  --keep-best-checkpoints "${KEEP_BEST_CHECKPOINTS}"
+  --val-fraction "${VAL_FRACTION}"
+  --val-videos-per-task "${VAL_VIDEOS_PER_TASK}"
+  --early-stopping-patience "${EARLY_STOPPING_PATIENCE}"
+  --early-stopping-threshold "${EARLY_STOPPING_THRESHOLD}"
+  --metric-for-best-model "${METRIC_FOR_BEST_MODEL}"
+  --eval-generation-max-samples "${EVAL_GENERATION_MAX_SAMPLES}"
+  --eval-generation-max-new-tokens "${EVAL_GENERATION_MAX_NEW_TOKENS}"
   --fps "${FPS}"
   --min-frames "${MIN_FRAMES}"
   --max-frames "${MAX_FRAMES}"
@@ -62,6 +94,37 @@ if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
   TRAIN_ARGS+=(--resume-from-checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
 
+if [[ -n "${SPLIT_FILE}" ]]; then
+  TRAIN_ARGS+=(--split-file "${SPLIT_FILE}")
+fi
+
+case "${GREATER_IS_BETTER}" in
+  1|true|TRUE|yes|YES)
+    TRAIN_ARGS+=(--greater-is-better)
+    ;;
+  0|false|FALSE|no|NO)
+    TRAIN_ARGS+=(--no-greater-is-better)
+    ;;
+  "")
+    ;;
+  *)
+    echo "GREATER_IS_BETTER must be true, false, or empty, got: ${GREATER_IS_BETTER}" >&2
+    exit 1
+    ;;
+esac
+
+case "${REGENERATE_SPLIT}" in
+  1|true|TRUE|yes|YES)
+    TRAIN_ARGS+=(--regenerate-split)
+    ;;
+  0|false|FALSE|no|NO)
+    ;;
+  *)
+    echo "REGENERATE_SPLIT must be true or false, got: ${REGENERATE_SPLIT}" >&2
+    exit 1
+    ;;
+esac
+
 case "${FINETUNE_VISION_LAYERS}" in
   1|true|TRUE|yes|YES)
     TRAIN_ARGS+=(--finetune-vision-layers)
@@ -75,7 +138,7 @@ case "${FINETUNE_VISION_LAYERS}" in
     ;;
 esac
 
-docker run --rm -it \
+docker run --rm "${DOCKER_TTY_ARGS[@]}" \
   --gpus all \
   --ipc=host \
   --ulimit memlock=-1 \
