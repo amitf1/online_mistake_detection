@@ -24,6 +24,7 @@ peft
 protobuf
 psutil
 qwen-vl-utils
+decord
 sentencepiece
 torchao
 tqdm

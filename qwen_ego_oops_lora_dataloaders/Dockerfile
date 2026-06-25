@@ -11,11 +11,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TRANSFORMERS_CACHE=/cache/huggingface
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     ffmpeg \
     git \
     libglib2.0-0 \
     libgl1 \
     python3 \
+    python3-dev \
     python3-pip \
     python3-venv \
     && rm -rf /var/lib/apt/lists/*
@@ -27,13 +29,13 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 RUN pip install --upgrade pip setuptools wheel
 
-COPY requirements.txt ./
-
 # Install torch first so Unsloth does not choose a CPU or incompatible wheel.
 RUN pip install "${TORCH_SPEC}" torchvision --index-url "${TORCH_INDEX_URL}"
 
 # Install Unsloth without dependency resolution to preserve the CUDA torch wheel.
 RUN pip install unsloth==2026.6.7 unsloth_zoo==2026.6.5 --no-deps
+
+COPY requirements.txt ./
 
 RUN pip install -r requirements.txt
 
