@@ -89,6 +89,7 @@ docker run --rm -it \
   -e HF_HOME=/cache/huggingface \
   -e TRANSFORMERS_CACHE=/cache/huggingface \
   -e FORCE_UNSLOTH_VIDEO_READER="${VIDEO_READER}" \
+  -e PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}" \
   -e WANDB_DIR="${WANDB_DIR}" \
   -e WANDB_PROJECT="${WANDB_PROJECT:-qwen-omd}" \
   -e WANDB_MODE="${WANDB_MODE:-online}" \

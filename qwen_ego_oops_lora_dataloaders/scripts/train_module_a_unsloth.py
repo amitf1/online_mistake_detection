@@ -239,6 +239,38 @@ def print_dry_run(dataset: EgoOopsModuleADataset, conversations: list[dict[str, 
         print(json.dumps(conversation, indent=2, ensure_ascii=False))
 
 
+def json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, list | tuple):
+        return [json_safe(item) for item in value]
+    if isinstance(value, set):
+        return sorted(json_safe(item) for item in value)
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    return value
+
+
+def save_run_config(
+    *,
+    args: argparse.Namespace,
+    dataset: EgoOopsModuleADataset,
+    conversations: list[dict[str, Any]],
+) -> None:
+    output_path = Path(args.output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    run_config = {
+        "args": json_safe(vars(args)),
+        "dataset_summary": summarize_module_a(dataset),
+        "num_conversations": len(conversations),
+    }
+    config_path = output_path / "run_config.json"
+    with open(config_path, "w", encoding="utf-8") as file:
+        json.dump(run_config, file, indent=2, sort_keys=True, ensure_ascii=False)
+        file.write("\n")
+    print(f"Saved run config to: {config_path}")
+
+
 def load_unsloth_model(args: argparse.Namespace) -> tuple[Any, Any]:
     from unsloth import FastVisionModel
 
@@ -500,6 +532,7 @@ def main() -> None:
 
     if not conversations:
         raise SystemExit("Module A dataset produced no conversations.")
+    save_run_config(args=args, dataset=dataset, conversations=conversations)
     if args.dry_run:
         print_dry_run(dataset, conversations, args.print_examples)
         return
