@@ -1344,6 +1344,12 @@ class EpochCheckpointCallback:
             },
         )
         artifact.add_dir(str(path), name=path.name)
+        run_config = self.output_dir / "run_config.json"
+        if run_config.exists():
+            artifact.add_file(str(run_config), name="run_config.json")
+        best_manifest = self.output_dir / "best_checkpoints.json"
+        if best_manifest.exists():
+            artifact.add_file(str(best_manifest), name="best_checkpoints.json")
         wandb.log_artifact(artifact, aliases=["best", f"epoch-{epoch}"])
         print(f"Logged W&B best checkpoint artifact: {artifact_name} ({path})")
 

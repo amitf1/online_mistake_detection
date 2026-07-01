@@ -23,6 +23,8 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_DIR}/outputs}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/module_a_qwen35_2b_lora_wait_complete_vision/runs/${RUN_NAME}}"
 EGO_OOPS_ROOT="${EGO_OOPS_ROOT:-${REPO_DIR}/ego_oops}"
 DATA_ROOT="${DATA_ROOT:-${REPO_DIR}/data/videos-processed-720p}"
+COPY_VIDEOS_TO_SHM="${COPY_VIDEOS_TO_SHM:-false}"
+SHM_VIDEO_ROOT="${SHM_VIDEO_ROOT:-/dev/shm/ego_oops_videos}"
 MAX_VIDEOS="${MAX_VIDEOS:-50}"
 MODEL_NAME="${MODEL_NAME:-unsloth/Qwen3.5-2B}"
 LOAD_IN_4BIT="${LOAD_IN_4BIT:-false}"
@@ -79,6 +81,31 @@ if [[ ! -f "${EGO_OOPS_ROOT}/EgoOops-annotations/meta/metadata_edited.json" ]]; 
   echo "Expected: ${EGO_OOPS_ROOT}/EgoOops-annotations/meta/metadata_edited.json" >&2
   exit 1
 fi
+
+case "${COPY_VIDEOS_TO_SHM}" in
+  1|true|TRUE|yes|YES)
+    if ! compgen -G "${DATA_ROOT}"'/*/*.MP4' > /dev/null; then
+      echo "Cannot copy videos to /dev/shm; no videos found under DATA_ROOT=${DATA_ROOT}" >&2
+      exit 1
+    fi
+    if [[ "${DATA_ROOT}" != "${SHM_VIDEO_ROOT}" ]]; then
+      mkdir -p "${SHM_VIDEO_ROOT}"
+      if ! compgen -G "${SHM_VIDEO_ROOT}"'/*/*.MP4' > /dev/null; then
+        echo "Copying EgoOops videos to shared memory: ${SHM_VIDEO_ROOT}"
+        cp -a "${DATA_ROOT}/." "${SHM_VIDEO_ROOT}/"
+      else
+        echo "Using existing shared-memory video copy: ${SHM_VIDEO_ROOT}"
+      fi
+      DATA_ROOT="${SHM_VIDEO_ROOT}"
+    fi
+    ;;
+  0|false|FALSE|no|NO)
+    ;;
+  *)
+    echo "COPY_VIDEOS_TO_SHM must be true or false, got: ${COPY_VIDEOS_TO_SHM}" >&2
+    exit 1
+    ;;
+esac
 
 if ! compgen -G "${DATA_ROOT}"'/*/*.MP4' > /dev/null; then
   echo "No EgoOops videos found under DATA_ROOT=${DATA_ROOT}" >&2
