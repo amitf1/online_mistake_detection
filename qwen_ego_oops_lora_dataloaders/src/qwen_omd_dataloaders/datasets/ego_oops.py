@@ -176,7 +176,7 @@ def build_module_a_windows(
             )
 
             while current_time < completion_deadline:
-                label = "[WAIT]" if current_time < segment.end else "[COMPLETE]"
+                label = "WAIT" if current_time < segment.end else "COMPLETE"
                 window = WindowSpec(
                     video_path=record.video_path,
                     video_id=record.video_id,
@@ -191,7 +191,7 @@ def build_module_a_windows(
                     completed_steps=tuple(completed),
                     pending_steps=pending,
                 )
-                if label == "[WAIT]":
+                if label == "WAIT":
                     pending_waits.append(window)
                     current_time += config.stride_seconds
                     continue
@@ -221,7 +221,7 @@ def build_module_a_windows(
                     window_end=complete_time,
                     gt_start=segment.start,
                     gt_end=segment.end,
-                    label="[COMPLETE]",
+                    label="COMPLETE",
                     completed_steps=tuple(completed),
                     pending_steps=pending,
                 )
@@ -327,7 +327,7 @@ class EgoOopsModuleBDataset(Dataset):
         examples: list[TrainingExample] = []
         complete_windows = [
             window for window in build_module_a_windows(self.records, config=self.module_a_config)
-            if window.label == "[COMPLETE]" and window.gt_start is not None and window.gt_end is not None
+            if window.label == "COMPLETE" and window.gt_start is not None and window.gt_end is not None
         ]
         instruction_lookup = _instruction_lookup(self.records)
 
@@ -379,7 +379,7 @@ class EgoOopsModuleBDataset(Dataset):
     ) -> list[TrainingExample]:
         wait_windows = [
             window for window in build_module_a_windows(self.records, config=self.module_a_config)
-            if window.label == "[WAIT]"
+            if window.label == "WAIT"
         ]
         k = min(len(wait_windows), round(len(complete_windows) * self.config.negative_ratio))
         selected = rng.sample(wait_windows, k) if k > 0 else []

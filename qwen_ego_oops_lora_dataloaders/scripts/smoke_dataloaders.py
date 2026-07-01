@@ -103,7 +103,7 @@ def main() -> None:
 
 
 def validate_example(module: str, target: str) -> None:
-    if module == "A" and target not in {"[WAIT]", "[COMPLETE]"}:
+    if module == "A" and target not in {"WAIT", "COMPLETE"}:
         raise SystemExit(f"Invalid Module A target: {target}")
     if module == "B" and not (re.match(r"^<time_\d{3}> to <time_\d{3}>$", target) or target == "<no_action>"):
         raise SystemExit(f"Invalid Module B target: {target}")

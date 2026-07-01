@@ -11,7 +11,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TRANSFORMERS_CACHE=/cache/huggingface
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    byobu \
     build-essential \
+    ca-certificates \
     ffmpeg \
     git \
     libglib2.0-0 \
@@ -20,9 +22,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-dev \
     python3-pip \
     python3-venv \
+    unzip \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /workspace/qwen_ego_oops_lora_dataloaders
+WORKDIR /workspace
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -38,11 +42,6 @@ RUN pip install unsloth==2026.6.7 unsloth_zoo==2026.6.5 --no-deps
 COPY requirements.txt ./
 
 RUN pip install -r requirements.txt
-
-COPY pyproject.toml README.md ./
-COPY src ./src
-COPY scripts ./scripts
-
-RUN pip install -e .
+RUN pip install vastai
 
 CMD ["bash"]

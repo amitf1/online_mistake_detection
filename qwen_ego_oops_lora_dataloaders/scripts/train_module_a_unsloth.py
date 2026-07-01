@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as dt
+import gc
 import inspect
 import json
 import math
 import random
 import shutil
+import subprocess
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -28,10 +30,63 @@ from qwen_omd_dataloaders.datasets import EgoOopsModuleADataset, EgoOopsProvider
 from qwen_omd_dataloaders.schema import TrainingExample  # noqa: E402
 
 MODULE_A_SYSTEM_PROMPT = "You are an online procedural step completion detector."
-DEFAULT_OUTPUT_DIR = "/nvcr/users/afeldman/omd/module_a_qwen35_2b_lora"
+DEFAULT_OUTPUT_DIR = "/home/amit/online_mistake_detection/outputs/module_a_qwen35_2b_lora_wait_complete_vision"
 MODULE_A_SPLIT_VERSION = 1
-MODULE_A_LABELS = ("[WAIT]", "[COMPLETE]")
-MODULE_A_POSITIVE_LABEL = "[COMPLETE]"
+MODULE_A_LABELS = ("WAIT", "COMPLETE")
+MODULE_A_POSITIVE_LABEL = "COMPLETE"
+
+
+def release_cuda_memory() -> None:
+    gc.collect()
+    try:
+        import torch
+    except ModuleNotFoundError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def generation_eval_examples(
+    examples: list[dict[str, Any]],
+    max_samples: int,
+) -> list[dict[str, Any]]:
+    if max_samples < 0:
+        return list(examples)
+    return examples[:max_samples]
+
+
+def move_optimizer_state_to_device(optimizer: Any, device: Any) -> None:
+    try:
+        import torch
+    except ModuleNotFoundError:
+        return
+    if optimizer is None:
+        return
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+def offload_trainer_cuda_state(trainer: Any) -> Any | None:
+    try:
+        import torch
+    except ModuleNotFoundError:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    trainer.model.to("cpu")
+    move_optimizer_state_to_device(getattr(trainer, "optimizer", None), torch.device("cpu"))
+    release_cuda_memory()
+    return torch.device("cuda")
+
+
+def restore_trainer_cuda_state(trainer: Any, device: Any | None) -> None:
+    if device is None:
+        return
+    trainer.model.to(device)
+    move_optimizer_state_to_device(getattr(trainer, "optimizer", None), device)
+    release_cuda_memory()
 
 
 def parse_args() -> argparse.Namespace:
@@ -147,12 +202,37 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--per-device-eval-batch-size", type=int, default=1)
-    parser.add_argument("--eval-generation-max-samples", type=int, default=50)
+    parser.add_argument(
+        "--eval-generation-max-samples",
+        type=int,
+        default=-1,
+        help="Generated-label metric sample cap. Use -1 for the full validation split, 0 to skip.",
+    )
+    parser.add_argument(
+        "--generation-eval-mode",
+        choices=("subprocess", "inline", "off"),
+        default="subprocess",
+        help="How to run generated-label validation metrics.",
+    )
+    parser.add_argument("--generation-eval-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--eval-checkpoint", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--generation-eval-output-json", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--eval-generation-max-new-tokens", type=int, default=8)
     parser.add_argument("--early-stopping-patience", type=int, default=3)
     parser.add_argument("--early-stopping-threshold", type=float, default=0.0)
     parser.add_argument("--metric-for-best-model", default="eval_loss")
     parser.add_argument("--greater-is-better", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--wandb-log-best-checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Upload every newly best checkpoint as a W&B model artifact.",
+    )
+    parser.add_argument(
+        "--wandb-artifact-prefix",
+        default="module-a",
+        help="Prefix for W&B checkpoint artifact names.",
+    )
     parser.add_argument("--keep-last-checkpoints", type=int, default=4)
     parser.add_argument("--keep-best-checkpoints", type=int, default=4)
     parser.add_argument("--save-total-limit", type=int, default=3, help=argparse.SUPPRESS)
@@ -172,6 +252,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--eval-steps must be positive.")
     if args.eval_epochs < 1:
         parser.error("--eval-epochs must be positive.")
+    if args.eval_generation_max_samples < -1:
+        parser.error("--eval-generation-max-samples must be -1, 0, or positive.")
+    if args.generation_eval_only and not args.eval_checkpoint:
+        parser.error("--generation-eval-only requires --eval-checkpoint.")
     if args.checkpoint_epochs < 1:
         parser.error("--checkpoint-epochs must be positive.")
     if args.keep_last_checkpoints < 0:
@@ -534,7 +618,7 @@ def save_run_config(
 
 
 def label_to_positive(label: str) -> bool:
-    return label.strip() == MODULE_A_POSITIVE_LABEL
+    return label.strip().strip("[]") == MODULE_A_POSITIVE_LABEL
 
 
 def binary_detection_metrics(
@@ -584,14 +668,14 @@ def binary_detection_metrics(
 
 def extract_module_a_label(text: str) -> str:
     for label in MODULE_A_LABELS:
-        if label in text:
+        if label in text.strip().strip("[]").upper():
             return label
     normalized = text.strip().upper()
     if "COMPLETE" in normalized:
-        return "[COMPLETE]"
+        return "COMPLETE"
     if "WAIT" in normalized:
-        return "[WAIT]"
-    return "[WAIT]"
+        return "WAIT"
+    return "WAIT"
 
 
 def load_unsloth_model(args: argparse.Namespace) -> tuple[Any, Any]:
@@ -617,7 +701,6 @@ def load_unsloth_model(args: argparse.Namespace) -> tuple[Any, Any]:
         use_rslora=False,
         loftq_config=None,
         target_modules="all-linear",
-        modules_to_save=["lm_head", "embed_tokens"],
         ensure_weight_tying=True,
     )
     try:
@@ -634,6 +717,20 @@ def load_unsloth_model(args: argparse.Namespace) -> tuple[Any, Any]:
         raise RuntimeError(
             "finetune_vision_layers=True, but no trainable visual parameters were found."
         )
+    return model, tokenizer
+
+
+def load_generation_eval_model(args: argparse.Namespace) -> tuple[Any, Any]:
+    from unsloth import FastVisionModel
+
+    model, tokenizer = FastVisionModel.from_pretrained(
+        model_name=args.eval_checkpoint or args.model_name,
+        max_seq_length=args.max_seq_length,
+        load_in_4bit=args.load_in_4bit,
+        load_in_16bit=args.load_in_16bit,
+        use_gradient_checkpointing=False,
+    )
+    FastVisionModel.for_inference(model)
     return model, tokenizer
 
 
@@ -791,7 +888,7 @@ class ModuleADetectionMetricsCallback:
 
         self._callback_base = TrainerCallback()
         self.trainer: Any | None = None
-        self.eval_examples = eval_examples[: max(0, max_samples)]
+        self.eval_examples = generation_eval_examples(eval_examples, max_samples)
         self.data_collator = data_collator
         self.tokenizer = tokenizer
         self.max_new_tokens = max_new_tokens
@@ -828,6 +925,7 @@ class ModuleADetectionMetricsCallback:
         finally:
             if was_training:
                 FastVisionModel.for_training(model)
+            release_cuda_memory()
 
         metrics = binary_detection_metrics(targets, predictions, prefix="eval_detection")
         for task_id in sorted(task_targets):
@@ -845,6 +943,7 @@ class ModuleADetectionMetricsCallback:
         if isinstance(callback_metrics, dict):
             callback_metrics.update(metrics)
         self.trainer.log(metrics)
+        release_cuda_memory()
         return control
 
     def _generation_inputs(self, example: dict[str, Any]) -> dict[str, Any]:
@@ -886,13 +985,144 @@ class ModuleADetectionMetricsCallback:
         generate_kwargs = {
             "max_new_tokens": self.max_new_tokens,
             "do_sample": False,
+            "use_cache": False,
         }
         pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
         if pad_token_id is not None:
             generate_kwargs["pad_token_id"] = pad_token_id
-        output_ids = model.generate(**inputs, **generate_kwargs)
-        generated_ids = output_ids[:, input_length:]
-        return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=False)[0]
+        try:
+            output_ids = model.generate(**inputs, **generate_kwargs)
+            generated_ids = output_ids[:, input_length:]
+            return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=False)[0]
+        finally:
+            del inputs
+            if "output_ids" in locals():
+                del output_ids
+            if "generated_ids" in locals():
+                del generated_ids
+            release_cuda_memory()
+
+
+def compute_generation_detection_metrics(
+    *,
+    model: Any,
+    tokenizer: Any,
+    eval_examples: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> dict[str, float]:
+    data_collator = Qwen3VLMetadataVisionDataCollator(
+        model,
+        tokenizer,
+        max_seq_length=args.max_seq_length,
+        resize=args.vision_resize,
+        train_on_responses_only=True,
+        instruction_part="<|im_start|>user\n",
+        response_part="<|im_start|>assistant\n",
+        completion_only_loss=True,
+    )
+    generator = ModuleADetectionMetricsCallback(
+        eval_examples=eval_examples,
+        data_collator=data_collator,
+        tokenizer=tokenizer,
+        max_samples=args.eval_generation_max_samples,
+        max_new_tokens=args.eval_generation_max_new_tokens,
+    )
+    predictions: list[str] = []
+    targets: list[str] = []
+    task_targets: dict[str, list[str]] = defaultdict(list)
+    task_predictions: dict[str, list[str]] = defaultdict(list)
+
+    for example in generator.eval_examples:
+        generated_text = generator._generate_label(model, example)
+        prediction = extract_module_a_label(generated_text)
+        target = str(example["target"])
+        task_id = str(example["task_id"])
+        predictions.append(prediction)
+        targets.append(target)
+        task_predictions[task_id].append(prediction)
+        task_targets[task_id].append(target)
+
+    metrics = binary_detection_metrics(targets, predictions, prefix="eval_detection")
+    for task_id in sorted(task_targets):
+        task_metrics = binary_detection_metrics(
+            task_targets[task_id],
+            task_predictions[task_id],
+            prefix=f"eval_detection/task_{task_id}",
+        )
+        metrics.update({
+            key: value
+            for key, value in task_metrics.items()
+            if key.endswith(("/accuracy", "/f1", "/recall", "/num_samples"))
+        })
+    return metrics
+
+
+def build_generation_eval_command(
+    *,
+    args: argparse.Namespace,
+    checkpoint_path: Path,
+    output_json: Path,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--generation-eval-only",
+        "--eval-checkpoint",
+        str(checkpoint_path),
+        "--generation-eval-output-json",
+        str(output_json),
+        "--metadata",
+        str(args.metadata),
+        "--mistake-classes",
+        str(args.mistake_classes),
+        "--video-root",
+        str(args.video_root),
+        "--max-videos",
+        str(args.max_videos),
+        "--fps",
+        str(args.fps),
+        "--min-frames",
+        str(args.min_frames),
+        "--max-frames",
+        str(args.max_frames),
+        "--stride-seconds",
+        str(args.stride_seconds),
+        "--completion-margin",
+        str(args.completion_margin),
+        "--negative-to-positive-ratio",
+        str(args.negative_to_positive_ratio),
+        "--keep-last-wait-windows",
+        str(args.keep_last_wait_windows),
+        "--max-seq-length",
+        str(args.max_seq_length),
+        "--vision-resize",
+        str(args.vision_resize),
+        "--eval-generation-max-samples",
+        str(args.eval_generation_max_samples),
+        "--eval-generation-max-new-tokens",
+        str(args.eval_generation_max_new_tokens),
+        "--output-dir",
+        str(args.output_dir),
+        "--seed",
+        str(args.seed),
+    ]
+    if args.split_file:
+        command.extend(["--split-file", str(args.split_file)])
+    if args.video_ids:
+        command.append("--video-ids")
+        command.extend(str(item) for item in args.video_ids)
+    if args.task_ids:
+        command.append("--task-ids")
+        command.extend(str(item) for item in args.task_ids)
+    command.append("--load-in-4bit" if args.load_in_4bit else "--no-load-in-4bit")
+    command.append("--load-in-16bit" if args.load_in_16bit else "--no-load-in-16bit")
+    return command
+
+
+def sanitize_wandb_artifact_name(name: str) -> str:
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+    sanitized = "".join(char if char in allowed else "-" for char in name)
+    return sanitized.strip(".-") or "checkpoint"
 
 
 class EpochCheckpointCallback:
@@ -908,6 +1138,9 @@ class EpochCheckpointCallback:
         keep_best_checkpoints: int,
         early_stopping_patience: int,
         early_stopping_threshold: float,
+        wandb_log_best_checkpoints: bool,
+        wandb_artifact_prefix: str,
+        generation_eval_args: argparse.Namespace,
     ) -> None:
         from transformers import TrainerCallback
 
@@ -922,6 +1155,9 @@ class EpochCheckpointCallback:
         self.keep_best_checkpoints = keep_best_checkpoints
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_threshold = early_stopping_threshold
+        self.wandb_log_best_checkpoints = wandb_log_best_checkpoints
+        self.wandb_artifact_prefix = wandb_artifact_prefix
+        self.generation_eval_args = generation_eval_args
         self.best_metric: float | None = None
         self.no_improvement_count = 0
         self.best_records: list[dict[str, Any]] = []
@@ -944,17 +1180,24 @@ class EpochCheckpointCallback:
 
         if epoch % self.eval_epochs == 0:
             control.should_evaluate = True
+        release_cuda_memory()
         return control
 
     def on_evaluate(self, args: Any, state: Any, control: Any, metrics: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         if not metrics:
             return control
+        epoch = self._epoch_label(state)
+        if self.generation_eval_args.generation_eval_mode == "subprocess":
+            generation_metrics = self._run_subprocess_generation_eval(epoch=epoch)
+            if generation_metrics:
+                metrics.update(generation_metrics)
+                if self.trainer is not None:
+                    self.trainer.log(generation_metrics)
         metric = self._metric_value(metrics)
         if metric is None:
             print(f"Metric {self.metric_for_best_model!r} was not found; skipping best checkpoint update.")
             return control
 
-        epoch = self._epoch_label(state)
         if self._is_improvement(metric):
             self.best_metric = metric
             self.no_improvement_count = 0
@@ -967,6 +1210,8 @@ class EpochCheckpointCallback:
             })
             self._prune_best_checkpoints()
             self._write_best_manifest()
+            if self.wandb_log_best_checkpoints and path.exists():
+                self._log_wandb_checkpoint(path=path, epoch=epoch, metric=metric, state=state)
         else:
             self.no_improvement_count += 1
             if (
@@ -979,6 +1224,7 @@ class EpochCheckpointCallback:
                     f"{self.metric_for_best_model}."
                 )
                 control.should_training_stop = True
+        release_cuda_memory()
         return control
 
     def on_train_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
@@ -1032,6 +1278,7 @@ class EpochCheckpointCallback:
         path.mkdir(parents=True, exist_ok=True)
         self.trainer.save_model(path)
         self.trainer.state.save_to_json(str(path / "trainer_state.json"))
+        release_cuda_memory()
         return path
 
     def _prune_epoch_checkpoints(self, prefix: str, keep: int) -> None:
@@ -1071,6 +1318,67 @@ class EpochCheckpointCallback:
         with open(self.output_dir / "best_checkpoints.json", "w", encoding="utf-8") as file:
             json.dump(manifest, file, indent=2, sort_keys=True)
             file.write("\n")
+
+    def _log_wandb_checkpoint(self, *, path: Path, epoch: str, metric: float, state: Any) -> None:
+        try:
+            import wandb
+        except ModuleNotFoundError:
+            print("W&B is not installed; skipping best checkpoint artifact upload.")
+            return
+        if wandb.run is None:
+            print("W&B run is not active; skipping best checkpoint artifact upload.")
+            return
+
+        run_id = wandb.run.id or "run"
+        artifact_name = sanitize_wandb_artifact_name(f"{self.wandb_artifact_prefix}-{run_id}-best")
+        artifact = wandb.Artifact(
+            name=artifact_name,
+            type="model",
+            metadata={
+                "checkpoint": path.name,
+                "epoch": epoch,
+                "global_step": state.global_step,
+                "metric_for_best_model": self.metric_for_best_model,
+                "metric": metric,
+                "greater_is_better": self.greater_is_better,
+            },
+        )
+        artifact.add_dir(str(path), name=path.name)
+        wandb.log_artifact(artifact, aliases=["best", f"epoch-{epoch}"])
+        print(f"Logged W&B best checkpoint artifact: {artifact_name} ({path})")
+
+    def _run_subprocess_generation_eval(self, *, epoch: str) -> dict[str, float]:
+        if self.trainer is None:
+            return {}
+        if self.generation_eval_args.eval_generation_max_samples == 0:
+            return {}
+
+        checkpoint_path = self.output_dir / "latest"
+        if not checkpoint_path.exists():
+            return {}
+
+        output_json = self.output_dir / f"generation_eval_ep{epoch}.json"
+        command = build_generation_eval_command(
+            args=self.generation_eval_args,
+            checkpoint_path=checkpoint_path,
+            output_json=output_json,
+        )
+        restore_device = offload_trainer_cuda_state(self.trainer)
+        try:
+            subprocess.run(command, check=True)
+        finally:
+            restore_trainer_cuda_state(self.trainer, restore_device)
+
+        if not output_json.exists():
+            return {}
+        with open(output_json, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+        metrics = payload.get("metrics", {})
+        return {
+            str(key): float(value)
+            for key, value in metrics.items()
+            if isinstance(value, int | float)
+        }
 
     @staticmethod
     def _epoch_from_name(name: str, prefix: str) -> int:
@@ -1118,6 +1426,7 @@ def build_trainer(
         report_to=args.report_to,
         dataset_num_proc=args.dataset_num_proc,
         max_seq_length=args.max_seq_length,
+        torch_empty_cache_steps=1,
         fp16=not bf16,
         bf16=bf16,
         remove_unused_columns=False,
@@ -1139,14 +1448,16 @@ def build_trainer(
         response_part="<|im_start|>assistant\n",
         completion_only_loss=True,
     )
-    detection_callback = ModuleADetectionMetricsCallback(
-        eval_examples=eval_dataset,
-        data_collator=data_collator,
-        tokenizer=tokenizer,
-        max_samples=args.eval_generation_max_samples,
-        max_new_tokens=args.eval_generation_max_new_tokens,
-    )
-    callbacks.append(detection_callback)
+    detection_callback: ModuleADetectionMetricsCallback | None = None
+    if args.generation_eval_mode == "inline" and args.eval_generation_max_samples != 0:
+        detection_callback = ModuleADetectionMetricsCallback(
+            eval_examples=eval_dataset,
+            data_collator=data_collator,
+            tokenizer=tokenizer,
+            max_samples=args.eval_generation_max_samples,
+            max_new_tokens=args.eval_generation_max_new_tokens,
+        )
+        callbacks.append(detection_callback)
     checkpoint_callback = EpochCheckpointCallback(
         output_dir=args.output_dir,
         eval_epochs=args.eval_epochs,
@@ -1157,6 +1468,9 @@ def build_trainer(
         keep_best_checkpoints=args.keep_best_checkpoints,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_threshold=args.early_stopping_threshold,
+        wandb_log_best_checkpoints=args.wandb_log_best_checkpoints,
+        wandb_artifact_prefix=args.wandb_artifact_prefix,
+        generation_eval_args=args,
     )
     callbacks.append(checkpoint_callback)
     trainer = SFTTrainer(
@@ -1168,7 +1482,8 @@ def build_trainer(
         args=SFTConfig(**trainer_args),
         callbacks=callbacks,
     )
-    detection_callback.trainer = trainer
+    if detection_callback is not None:
+        detection_callback.trainer = trainer
     checkpoint_callback.trainer = trainer
     return trainer
 
@@ -1179,6 +1494,43 @@ def save_outputs(model: Any, tokenizer: Any, output_dir: str | Path) -> None:
     model.save_pretrained(output_path)
     tokenizer.save_pretrained(output_path)
     print(f"Saved LoRA adapter and tokenizer to: {output_path}")
+
+
+def run_generation_eval_only(
+    *,
+    args: argparse.Namespace,
+    val_conversations: list[dict[str, Any]],
+) -> None:
+    if args.eval_generation_max_samples == 0:
+        metrics: dict[str, float] = {}
+    else:
+        model, tokenizer = load_generation_eval_model(args)
+        metrics = compute_generation_detection_metrics(
+            model=model,
+            tokenizer=tokenizer,
+            eval_examples=val_conversations,
+            args=args,
+        )
+        del model
+        release_cuda_memory()
+
+    payload = {
+        "checkpoint": args.eval_checkpoint,
+        "num_validation_examples": len(val_conversations),
+        "num_generation_examples": (
+            len(val_conversations)
+            if args.eval_generation_max_samples < 0
+            else min(args.eval_generation_max_samples, len(val_conversations))
+        ),
+        "metrics": metrics,
+    }
+    if args.generation_eval_output_json:
+        output_path = Path(args.generation_eval_output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2, sort_keys=True)
+            file.write("\n")
+    print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def main() -> None:
@@ -1195,15 +1547,9 @@ def main() -> None:
         raise SystemExit("Module A dataset produced no conversations.")
     split, split_path = load_or_create_video_split(dataset, args)
     train_conversations, val_conversations = split_conversations(conversations, split)
-    save_run_config(
-        args=args,
-        dataset=dataset,
-        conversations=conversations,
-        train_conversations=train_conversations,
-        val_conversations=val_conversations,
-        split=split,
-        split_path=split_path,
-    )
+    if args.generation_eval_only:
+        run_generation_eval_only(args=args, val_conversations=val_conversations)
+        return
     if args.dry_run:
         print_dry_run(
             dataset,
@@ -1214,6 +1560,15 @@ def main() -> None:
             args.print_examples,
         )
         return
+    save_run_config(
+        args=args,
+        dataset=dataset,
+        conversations=conversations,
+        train_conversations=train_conversations,
+        val_conversations=val_conversations,
+        split=split,
+        split_path=split_path,
+    )
 
     print("Module A full dataset summary:")
     print(json.dumps(summarize_module_a(dataset), indent=2, ensure_ascii=False))

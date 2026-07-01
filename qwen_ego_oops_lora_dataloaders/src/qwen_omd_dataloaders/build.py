@@ -41,7 +41,7 @@ def add_special_training_tokens(
         cfg.token_template.format(index=index)
         for index in range(cfg.num_bins)
     ]
-    tokens.extend([cfg.no_action_token, "[WAIT]", "[COMPLETE]"])
+    tokens.append(cfg.no_action_token)
     existing_vocab = tokenizer.get_vocab()
     new_tokens = [token for token in tokens if token not in existing_vocab]
     if not new_tokens:
