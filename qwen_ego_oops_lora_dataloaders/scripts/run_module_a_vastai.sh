@@ -4,11 +4,20 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 
+load_env_defaults() {
+  local env_file="$1"
+  local line key
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" || "${line}" == \#* || "${line}" != *=* ]] && continue
+    key="${line%%=*}"
+    if [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && -z "${!key+x}" ]]; then
+      export "${line}"
+    fi
+  done < "${env_file}"
+}
+
 if [[ -f "${REPO_DIR}/.env" ]]; then
-  set -a
-  # shellcheck source=/dev/null
-  source "${REPO_DIR}/.env"
-  set +a
+  load_env_defaults "${REPO_DIR}/.env"
 fi
 
 if [[ -n "${VAST_API_KEY:-}" ]]; then
@@ -56,7 +65,9 @@ VISION_RESIZE="${VISION_RESIZE:-512}"
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-6144}"
 FINETUNE_VISION_LAYERS="${FINETUNE_VISION_LAYERS:-false}"
 UPLOAD_FINAL_CHECKPOINTS_TO_WANDB="${UPLOAD_FINAL_CHECKPOINTS_TO_WANDB:-true}"
+UPLOAD_FINAL_CHECKPOINTS_ON_FAILURE="${UPLOAD_FINAL_CHECKPOINTS_ON_FAILURE:-false}"
 DESTROY_VAST_INSTANCE_ON_EXIT="${DESTROY_VAST_INSTANCE_ON_EXIT:-false}"
+DESTROY_VAST_INSTANCE_ON_FAILURE="${DESTROY_VAST_INSTANCE_ON_FAILURE:-false}"
 VAST_INSTANCE_ID="${VAST_INSTANCE_ID:-}"
 
 export RUN_TIMESTAMP RUN_NAME OUTPUT_ROOT OUTPUT_DIR
@@ -179,8 +190,16 @@ destroy_vast_instance() {
 cleanup() {
   exit_code=$?
   set +e
-  upload_final_checkpoints
-  destroy_vast_instance
+  if [[ "${exit_code}" -eq 0 || "${UPLOAD_FINAL_CHECKPOINTS_ON_FAILURE}" =~ ^(1|true|TRUE|yes|YES)$ ]]; then
+    upload_final_checkpoints
+  else
+    echo "Training exited with code ${exit_code}; skipping final W&B checkpoint upload."
+  fi
+  if [[ "${exit_code}" -eq 0 || "${DESTROY_VAST_INSTANCE_ON_FAILURE}" =~ ^(1|true|TRUE|yes|YES)$ ]]; then
+    destroy_vast_instance
+  else
+    echo "Training exited with code ${exit_code}; not destroying Vast.ai instance."
+  fi
   exit "${exit_code}"
 }
 trap cleanup EXIT

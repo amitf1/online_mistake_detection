@@ -4,11 +4,20 @@ set -euo pipefail
 IMAGE_NAME="${IMAGE_NAME:-qwen-omd-dataloaders:latest}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+load_env_defaults() {
+  local env_file="$1"
+  local line key
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" || "${line}" == \#* || "${line}" != *=* ]] && continue
+    key="${line%%=*}"
+    if [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && -z "${!key+x}" ]]; then
+      export "${line}"
+    fi
+  done < "${env_file}"
+}
+
 if [[ -f "${PROJECT_DIR}/../.env" ]]; then
-  set -a
-  # shellcheck source=/dev/null
-  source "${PROJECT_DIR}/../.env"
-  set +a
+  load_env_defaults "${PROJECT_DIR}/../.env"
 fi
 
 EGO_OOPS_ROOT="${EGO_OOPS_ROOT:-$(cd "${PROJECT_DIR}/../ego_oops" && pwd)}"
