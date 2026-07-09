@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import json
 import math
+import os
 import re
 import sys
 from collections import Counter, defaultdict
@@ -45,6 +46,9 @@ MODULE_B_SYSTEM_PROMPT = (
     "{\"relevant_windows\":[[\"start_seconds\",\"end_seconds\"]]} using seconds relative to the start of the clip. "
     "If the instruction attempt is not completed in the clip, return not completed."
 )
+
+os.environ["UNSLOTH_RETURN_LOGITS"] = "0"
+os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
 
 def parse_args() -> argparse.Namespace:

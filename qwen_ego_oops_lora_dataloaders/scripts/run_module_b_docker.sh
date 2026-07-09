@@ -41,6 +41,9 @@ MAX_VIDEOS="${MAX_VIDEOS:-50}"
 MODEL_NAME="${MODEL_NAME:-unsloth/Qwen3.5-2B}"
 LOAD_IN_4BIT="${LOAD_IN_4BIT:-false}"
 LOAD_IN_16BIT="${LOAD_IN_16BIT:-true}"
+LORA_R="${LORA_R:-16}"
+LORA_ALPHA="${LORA_ALPHA:-16}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
 TRAIN_MODE="${TRAIN_MODE:-steps}"
 MAX_STEPS="${MAX_STEPS:-100}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-3.0}"
@@ -97,6 +100,9 @@ fi
 TRAIN_ARGS=(
   python scripts/train_module_b_unsloth.py
   --model-name "${MODEL_NAME}"
+  --lora-r "${LORA_R}"
+  --lora-alpha "${LORA_ALPHA}"
+  --lora-dropout "${LORA_DROPOUT}"
   --max-videos "${MAX_VIDEOS}"
   --train-mode "${TRAIN_MODE}"
   --max-steps "${MAX_STEPS}"
@@ -187,6 +193,8 @@ docker run --rm "${DOCKER_TTY_ARGS[@]}" \
   -e TRANSFORMERS_CACHE=/cache/huggingface \
   -e FORCE_UNSLOTH_VIDEO_READER="${VIDEO_READER}" \
   -e PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}" \
+  -e UNSLOTH_RETURN_LOGITS=0 \
+  -e UNSLOTH_RETURN_HIDDEN_STATES=0 \
   -e WANDB_DIR="${WANDB_DIR}" \
   -e WANDB_PROJECT="${WANDB_PROJECT:-qwen-omd}" \
   -e WANDB_MODE="${WANDB_MODE:-online}" \
