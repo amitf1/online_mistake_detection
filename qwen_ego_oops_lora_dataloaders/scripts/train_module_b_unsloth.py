@@ -51,6 +51,11 @@ MODULE_B_SYSTEM_PROMPT = (
 )
 
 
+def disable_unsloth_extra_outputs() -> None:
+    os.environ["UNSLOTH_RETURN_LOGITS"] = "0"
+    os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fine-tune Qwen VL for Module B temporal grounding.")
     parser.add_argument("--metadata", default=DEFAULT_METADATA_PATH)
@@ -516,6 +521,28 @@ class ModuleBTemporalMetricsCallback:
             release_cuda_memory()
 
 
+class ModuleBUnslothEnvGuardCallback:
+    def __init__(self) -> None:
+        from transformers import TrainerCallback
+
+        self._callback_base = TrainerCallback()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._callback_base, name)
+
+    def on_step_begin(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        disable_unsloth_extra_outputs()
+        return control
+
+    def on_evaluate(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        disable_unsloth_extra_outputs()
+        return control
+
+    def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        disable_unsloth_extra_outputs()
+        return control
+
+
 def build_trainer(
     *,
     model: Any,
@@ -533,7 +560,7 @@ def build_trainer(
     bf16 = is_bf16_available()
     hf_train_dataset = Dataset.from_list(train_dataset)
     hf_eval_dataset = Dataset.from_list(eval_dataset)
-    callbacks: list[TrainerCallback] = []
+    callbacks: list[TrainerCallback] = [ModuleBUnslothEnvGuardCallback()]
     trainer_args = dict(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
