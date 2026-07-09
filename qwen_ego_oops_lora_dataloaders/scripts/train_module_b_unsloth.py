@@ -11,6 +11,9 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+os.environ["UNSLOTH_RETURN_LOGITS"] = "0"
+os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -46,9 +49,6 @@ MODULE_B_SYSTEM_PROMPT = (
     "{\"relevant_windows\":[[\"start_seconds\",\"end_seconds\"]]} using seconds relative to the start of the clip. "
     "If the instruction attempt is not completed in the clip, return not completed."
 )
-
-os.environ["UNSLOTH_RETURN_LOGITS"] = "0"
-os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
 
 def parse_args() -> argparse.Namespace:
@@ -644,6 +644,11 @@ def print_dry_run(
 
 def main() -> None:
     args = parse_args()
+    print(
+        "Module B Unsloth env: "
+        f"UNSLOTH_RETURN_LOGITS={os.environ.get('UNSLOTH_RETURN_LOGITS')}, "
+        f"UNSLOTH_RETURN_HIDDEN_STATES={os.environ.get('UNSLOTH_RETURN_HIDDEN_STATES')}"
+    )
     dataset = build_module_b_dataset(args)
     conversations = to_unsloth_conversations(dataset, fps=args.fps, min_frames=args.min_frames, max_frames=args.max_frames)
     if not conversations:
