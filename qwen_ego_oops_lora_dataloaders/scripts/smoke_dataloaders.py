@@ -105,8 +105,21 @@ def main() -> None:
 def validate_example(module: str, target: str) -> None:
     if module == "A" and target not in {"WAIT", "COMPLETE"}:
         raise SystemExit(f"Invalid Module A target: {target}")
-    if module == "B" and not (re.match(r"^<time_\d{3}> to <time_\d{3}>$", target) or target == "<no_action>"):
-        raise SystemExit(f"Invalid Module B target: {target}")
+    if module == "B":
+        parsed = json.loads(target)
+        windows = parsed.get("relevant_windows")
+        if not isinstance(windows, list):
+            raise SystemExit(f"Invalid Module B JSON target: {target}")
+        for window in windows:
+            if not (
+                isinstance(window, list)
+                and len(window) == 2
+                and all(isinstance(item, str) for item in window)
+            ):
+                raise SystemExit(f"Invalid Module B time window: {target}")
+            start, end = (float(window[0]), float(window[1]))
+            if start < 0 or end < start:
+                raise SystemExit(f"Invalid Module B span order: {target}")
     if module == "C":
         parsed = json.loads(target)
         if set(parsed) != {"mistake", "reasoning"}:

@@ -14,7 +14,7 @@ except ModuleNotFoundError:
 
 from ..config import ModuleAConfig, ModuleBConfig, ModuleCConfig, TimeTokenConfig
 from ..schema import Segment, TrainingExample, VideoRecord, WindowSpec
-from ..time_tokens import render_time_span_target
+from ..time_tokens import render_seconds_span_target
 from ..video import video_duration_seconds
 
 
@@ -128,7 +128,11 @@ def _module_a_prompt(
 def _module_b_prompt(instruction: str) -> str:
     return (
         f"Instruction: {instruction}\n"
-        "Identify the precise start and end boundaries."
+        "Identify the precise start and end boundaries for the attempt at this instruction in the provided video clip. "
+        "The attempt may include mistakes or deviate from the exact instruction wording.\n"
+        "If the attempt is visible, return JSON only as "
+        "{\"relevant_windows\":[[\"start_seconds\",\"end_seconds\"]]} using seconds relative to the start of this clip. "
+        "If the attempt is not completed in the clip, return exactly: not completed"
     )
 
 
@@ -343,12 +347,10 @@ class EgoOopsModuleBDataset(Dataset):
             if end - start < 0.5:
                 continue
             instruction = instruction_lookup.get((window.video_id, window.step_index), f"step {window.step_index}")
-            target = render_time_span_target(
+            target = render_seconds_span_target(
                 gt_start=window.gt_start,
                 gt_end=window.gt_end,
                 window_start=start,
-                window_end=end,
-                config=self.time_config,
             )
             examples.append(TrainingExample(
                 module="B",
@@ -364,7 +366,13 @@ class EgoOopsModuleBDataset(Dataset):
                 prompt_text=_module_b_prompt(instruction),
                 target_text=target,
                 label="LOCALIZE",
-                metadata={"instruction": instruction},
+                metadata={
+                    "instruction": instruction,
+                    "clip_relative_gt_start": window.gt_start - start,
+                    "clip_relative_gt_end": window.gt_end - start,
+                    "original_gt_start": window.gt_start,
+                    "original_gt_end": window.gt_end,
+                },
             ))
 
         if self.config.include_incomplete_negatives:
@@ -398,7 +406,7 @@ class EgoOopsModuleBDataset(Dataset):
                 gt_start=window.gt_start,
                 gt_end=window.gt_end,
                 prompt_text=_module_b_prompt(instruction),
-                target_text=TimeTokenConfig().no_action_token,
+                target_text="not completed",
                 label="NO_ACTION",
                 metadata={"instruction": instruction},
             ))

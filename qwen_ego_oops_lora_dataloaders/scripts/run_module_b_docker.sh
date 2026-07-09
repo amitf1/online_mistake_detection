@@ -19,8 +19,8 @@ load_env_defaults() {
 if [[ -f "${PROJECT_DIR}/../.env" ]]; then
   load_env_defaults "${PROJECT_DIR}/../.env"
 fi
-if [[ -f "${PROJECT_DIR}/../.env.module_a" ]]; then
-  load_env_defaults "${PROJECT_DIR}/../.env.module_a"
+if [[ -f "${PROJECT_DIR}/../.env.module_b" ]]; then
+  load_env_defaults "${PROJECT_DIR}/../.env.module_b"
 fi
 
 EGO_OOPS_ROOT="${EGO_OOPS_ROOT:-$(cd "${PROJECT_DIR}/../ego_oops" && pwd)}"
@@ -41,9 +41,6 @@ MAX_VIDEOS="${MAX_VIDEOS:-50}"
 MODEL_NAME="${MODEL_NAME:-unsloth/Qwen3.5-2B}"
 LOAD_IN_4BIT="${LOAD_IN_4BIT:-false}"
 LOAD_IN_16BIT="${LOAD_IN_16BIT:-true}"
-LORA_R="${LORA_R:-8}"
-LORA_ALPHA="${LORA_ALPHA:-16}"
-LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
 TRAIN_MODE="${TRAIN_MODE:-steps}"
 MAX_STEPS="${MAX_STEPS:-100}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-3.0}"
@@ -55,19 +52,16 @@ VAL_FRACTION="${VAL_FRACTION:-0.2}"
 VAL_VIDEOS_PER_TASK="${VAL_VIDEOS_PER_TASK:-2}"
 SPLIT_FILE="${SPLIT_FILE:-}"
 REGENERATE_SPLIT="${REGENERATE_SPLIT:-false}"
-POSITIVE_OVERSAMPLE_FACTOR="${POSITIVE_OVERSAMPLE_FACTOR:-1.0}"
-POSITIVE_LOSS_WEIGHT="${POSITIVE_LOSS_WEIGHT:-1.0}"
 EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-3}"
 EARLY_STOPPING_THRESHOLD="${EARLY_STOPPING_THRESHOLD:-0.0}"
-METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-eval_loss}"
-GREATER_IS_BETTER="${GREATER_IS_BETTER:-}"
-LABEL_SCORE_EVAL="${LABEL_SCORE_EVAL:-false}"
-FBETA_BETA="${FBETA_BETA:-2.0}"
+METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-eval_temporal/mean_iou}"
+GREATER_IS_BETTER="${GREATER_IS_BETTER:-true}"
 WANDB_LOG_BEST_CHECKPOINTS="${WANDB_LOG_BEST_CHECKPOINTS:-false}"
-WANDB_ARTIFACT_PREFIX="${WANDB_ARTIFACT_PREFIX:-module-a}"
+WANDB_ARTIFACT_PREFIX="${WANDB_ARTIFACT_PREFIX:-module-b}"
+INCLUDE_INCOMPLETE_NEGATIVES="${INCLUDE_INCOMPLETE_NEGATIVES:-false}"
+MODULE_B_NEGATIVE_RATIO="${MODULE_B_NEGATIVE_RATIO:-0.25}"
 EVAL_GENERATION_MAX_SAMPLES="${EVAL_GENERATION_MAX_SAMPLES:--1}"
-EVAL_GENERATION_MAX_NEW_TOKENS="${EVAL_GENERATION_MAX_NEW_TOKENS:-8}"
-GENERATION_EVAL_MODE="${GENERATION_EVAL_MODE:-subprocess}"
+EVAL_GENERATION_MAX_NEW_TOKENS="${EVAL_GENERATION_MAX_NEW_TOKENS:-64}"
 FPS="${FPS:-1.0}"
 MIN_FRAMES="${MIN_FRAMES:-2}"
 MAX_FRAMES="${MAX_FRAMES:-32}"
@@ -76,8 +70,8 @@ MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-6144}"
 FINETUNE_VISION_LAYERS="${FINETUNE_VISION_LAYERS:-false}"
 VIDEO_READER="${VIDEO_READER:-decord}"
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-RUN_NAME="${RUN_NAME:-module_a_qwen35_2b_lora_wait_complete_vision_${RUN_TIMESTAMP}}"
-OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/module_a_qwen35_2b_lora_wait_complete_vision/runs/${RUN_NAME}}"
+RUN_NAME="${RUN_NAME:-module_b_qwen35_lora_grounding_${RUN_TIMESTAMP}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/module_b_qwen35_lora_grounding/runs/${RUN_NAME}}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 DRY_RUN="${DRY_RUN:-false}"
 PRINT_EXAMPLES="${PRINT_EXAMPLES:-2}"
@@ -86,20 +80,12 @@ mkdir -p "${OUTPUT_ROOT}" "${OUTPUT_DIR}" "${HF_CACHE}" "${WANDB_DIR}"
 
 if [[ ! -f "${EGO_OOPS_ROOT}/EgoOops-annotations/meta/metadata_edited.json" ]]; then
   echo "Missing EgoOops annotations under EGO_OOPS_ROOT=${EGO_OOPS_ROOT}" >&2
-  echo "Expected: ${EGO_OOPS_ROOT}/EgoOops-annotations/meta/metadata_edited.json" >&2
   exit 1
 fi
 
 if ! compgen -G "${DATA_ROOT}"'/*/*.MP4' > /dev/null; then
   echo "No EgoOops videos found under DATA_ROOT=${DATA_ROOT}" >&2
-  echo "Expected paths like: ${DATA_ROOT}/blacklight/S1800001.MP4" >&2
   echo "Set DATA_ROOT=/path/to/videos-processed-720p when running this script." >&2
-  exit 1
-fi
-
-if (( MAX_FRAMES >= 32 && MAX_SEQ_LENGTH < 4096 )); then
-  echo "MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH} is too small for MAX_FRAMES=${MAX_FRAMES}." >&2
-  echo "Use MAX_SEQ_LENGTH=6144, or reduce MAX_FRAMES/VISION_RESIZE." >&2
   exit 1
 fi
 
@@ -109,11 +95,8 @@ if [[ -t 0 ]]; then
 fi
 
 TRAIN_ARGS=(
-  python scripts/train_module_a_unsloth.py
+  python scripts/train_module_b_unsloth.py
   --model-name "${MODEL_NAME}"
-  --lora-r "${LORA_R}"
-  --lora-alpha "${LORA_ALPHA}"
-  --lora-dropout "${LORA_DROPOUT}"
   --max-videos "${MAX_VIDEOS}"
   --train-mode "${TRAIN_MODE}"
   --max-steps "${MAX_STEPS}"
@@ -124,16 +107,13 @@ TRAIN_ARGS=(
   --keep-best-checkpoints "${KEEP_BEST_CHECKPOINTS}"
   --val-fraction "${VAL_FRACTION}"
   --val-videos-per-task "${VAL_VIDEOS_PER_TASK}"
-  --positive-oversample-factor "${POSITIVE_OVERSAMPLE_FACTOR}"
-  --positive-loss-weight "${POSITIVE_LOSS_WEIGHT}"
   --early-stopping-patience "${EARLY_STOPPING_PATIENCE}"
   --early-stopping-threshold "${EARLY_STOPPING_THRESHOLD}"
   --metric-for-best-model "${METRIC_FOR_BEST_MODEL}"
-  --fbeta-beta "${FBETA_BETA}"
   --wandb-artifact-prefix "${WANDB_ARTIFACT_PREFIX}"
+  --module-b-negative-ratio "${MODULE_B_NEGATIVE_RATIO}"
   --eval-generation-max-samples "${EVAL_GENERATION_MAX_SAMPLES}"
   --eval-generation-max-new-tokens "${EVAL_GENERATION_MAX_NEW_TOKENS}"
-  --generation-eval-mode "${GENERATION_EVAL_MODE}"
   --fps "${FPS}"
   --min-frames "${MIN_FRAMES}"
   --max-frames "${MAX_FRAMES}"
@@ -145,134 +125,51 @@ TRAIN_ARGS=(
 )
 
 case "${LOAD_IN_4BIT}" in
-  1|true|TRUE|yes|YES)
-    TRAIN_ARGS+=(--load-in-4bit)
-    ;;
-  0|false|FALSE|no|NO)
-    TRAIN_ARGS+=(--no-load-in-4bit)
-    ;;
-  *)
-    echo "LOAD_IN_4BIT must be true or false, got: ${LOAD_IN_4BIT}" >&2
-    exit 1
-    ;;
+  1|true|TRUE|yes|YES) TRAIN_ARGS+=(--load-in-4bit) ;;
+  0|false|FALSE|no|NO) TRAIN_ARGS+=(--no-load-in-4bit) ;;
+  *) echo "LOAD_IN_4BIT must be true or false, got: ${LOAD_IN_4BIT}" >&2; exit 1 ;;
 esac
-
 case "${LOAD_IN_16BIT}" in
-  1|true|TRUE|yes|YES)
-    TRAIN_ARGS+=(--load-in-16bit)
-    ;;
-  0|false|FALSE|no|NO)
-    TRAIN_ARGS+=(--no-load-in-16bit)
-    ;;
-  *)
-    echo "LOAD_IN_16BIT must be true or false, got: ${LOAD_IN_16BIT}" >&2
-    exit 1
-    ;;
+  1|true|TRUE|yes|YES) TRAIN_ARGS+=(--load-in-16bit) ;;
+  0|false|FALSE|no|NO) TRAIN_ARGS+=(--no-load-in-16bit) ;;
+  *) echo "LOAD_IN_16BIT must be true or false, got: ${LOAD_IN_16BIT}" >&2; exit 1 ;;
 esac
-
 case "${WANDB_LOG_BEST_CHECKPOINTS}" in
-  1|true|TRUE|yes|YES)
-    TRAIN_ARGS+=(--wandb-log-best-checkpoints)
-    ;;
-  0|false|FALSE|no|NO)
-    TRAIN_ARGS+=(--no-wandb-log-best-checkpoints)
-    ;;
-  *)
-    echo "WANDB_LOG_BEST_CHECKPOINTS must be true or false, got: ${WANDB_LOG_BEST_CHECKPOINTS}" >&2
-    exit 1
-    ;;
+  1|true|TRUE|yes|YES) TRAIN_ARGS+=(--wandb-log-best-checkpoints) ;;
+  0|false|FALSE|no|NO) TRAIN_ARGS+=(--no-wandb-log-best-checkpoints) ;;
+  *) echo "WANDB_LOG_BEST_CHECKPOINTS must be true or false, got: ${WANDB_LOG_BEST_CHECKPOINTS}" >&2; exit 1 ;;
 esac
-
+case "${INCLUDE_INCOMPLETE_NEGATIVES}" in
+  1|true|TRUE|yes|YES) TRAIN_ARGS+=(--include-incomplete-negatives) ;;
+  0|false|FALSE|no|NO) TRAIN_ARGS+=(--no-include-incomplete-negatives) ;;
+  *) echo "INCLUDE_INCOMPLETE_NEGATIVES must be true or false, got: ${INCLUDE_INCOMPLETE_NEGATIVES}" >&2; exit 1 ;;
+esac
 case "${DRY_RUN}" in
-  1|true|TRUE|yes|YES)
-    TRAIN_ARGS+=(--dry-run --print-examples "${PRINT_EXAMPLES}")
-    ;;
-  0|false|FALSE|no|NO)
-    ;;
-  *)
-    echo "DRY_RUN must be true or false, got: ${DRY_RUN}" >&2
-    exit 1
-    ;;
+  1|true|TRUE|yes|YES) TRAIN_ARGS+=(--dry-run --print-examples "${PRINT_EXAMPLES}") ;;
+  0|false|FALSE|no|NO) ;;
+  *) echo "DRY_RUN must be true or false, got: ${DRY_RUN}" >&2; exit 1 ;;
 esac
-
-case "${LABEL_SCORE_EVAL}" in
-  1|true|TRUE|yes|YES)
-    TRAIN_ARGS+=(--label-score-eval)
-    UNSLOTH_RETURN_LOGITS="1"
-    UNSLOTH_RETURN_HIDDEN_STATES="1"
-    ;;
-  0|false|FALSE|no|NO)
-    TRAIN_ARGS+=(--no-label-score-eval)
-    ;;
-  *)
-    echo "LABEL_SCORE_EVAL must be true or false, got: ${LABEL_SCORE_EVAL}" >&2
-    exit 1
-    ;;
-esac
-
-if [[ "${POSITIVE_LOSS_WEIGHT}" != "1.0" && "${POSITIVE_LOSS_WEIGHT}" != "1" ]]; then
-  UNSLOTH_RETURN_LOGITS="1"
-  UNSLOTH_RETURN_HIDDEN_STATES="1"
-fi
-
-if [[ "${UNSLOTH_RETURN_LOGITS:-}" == "1" || "${UNSLOTH_RETURN_HIDDEN_STATES:-}" == "1" ]]; then
-  UNSLOTH_COMPILE_LOCATION="${UNSLOTH_COMPILE_LOCATION:-/tmp/unsloth_compiled_cache_${RUN_NAME}}"
-  echo "Using Unsloth compile cache: ${UNSLOTH_COMPILE_LOCATION}"
-  TRAIN_ARGS=(
-    env
-    UNSLOTH_RETURN_LOGITS="${UNSLOTH_RETURN_LOGITS:-1}"
-    UNSLOTH_RETURN_HIDDEN_STATES="${UNSLOTH_RETURN_HIDDEN_STATES:-1}"
-    UNSLOTH_COMPILE_LOCATION="${UNSLOTH_COMPILE_LOCATION}"
-    "${TRAIN_ARGS[@]}"
-  )
-fi
-
 if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
   TRAIN_ARGS+=(--resume-from-checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
-
 if [[ -n "${SPLIT_FILE}" ]]; then
   TRAIN_ARGS+=(--split-file "${SPLIT_FILE}")
 fi
-
 case "${GREATER_IS_BETTER}" in
-  1|true|TRUE|yes|YES)
-    TRAIN_ARGS+=(--greater-is-better)
-    ;;
-  0|false|FALSE|no|NO)
-    TRAIN_ARGS+=(--no-greater-is-better)
-    ;;
-  "")
-    ;;
-  *)
-    echo "GREATER_IS_BETTER must be true, false, or empty, got: ${GREATER_IS_BETTER}" >&2
-    exit 1
-    ;;
+  1|true|TRUE|yes|YES) TRAIN_ARGS+=(--greater-is-better) ;;
+  0|false|FALSE|no|NO) TRAIN_ARGS+=(--no-greater-is-better) ;;
+  "") ;;
+  *) echo "GREATER_IS_BETTER must be true, false, or empty, got: ${GREATER_IS_BETTER}" >&2; exit 1 ;;
 esac
-
 case "${REGENERATE_SPLIT}" in
-  1|true|TRUE|yes|YES)
-    TRAIN_ARGS+=(--regenerate-split)
-    ;;
-  0|false|FALSE|no|NO)
-    ;;
-  *)
-    echo "REGENERATE_SPLIT must be true or false, got: ${REGENERATE_SPLIT}" >&2
-    exit 1
-    ;;
+  1|true|TRUE|yes|YES) TRAIN_ARGS+=(--regenerate-split) ;;
+  0|false|FALSE|no|NO) ;;
+  *) echo "REGENERATE_SPLIT must be true or false, got: ${REGENERATE_SPLIT}" >&2; exit 1 ;;
 esac
-
 case "${FINETUNE_VISION_LAYERS}" in
-  1|true|TRUE|yes|YES)
-    TRAIN_ARGS+=(--finetune-vision-layers)
-    ;;
-  0|false|FALSE|no|NO)
-    TRAIN_ARGS+=(--no-finetune-vision-layers)
-    ;;
-  *)
-    echo "FINETUNE_VISION_LAYERS must be true or false, got: ${FINETUNE_VISION_LAYERS}" >&2
-    exit 1
-    ;;
+  1|true|TRUE|yes|YES) TRAIN_ARGS+=(--finetune-vision-layers) ;;
+  0|false|FALSE|no|NO) TRAIN_ARGS+=(--no-finetune-vision-layers) ;;
+  *) echo "FINETUNE_VISION_LAYERS must be true or false, got: ${FINETUNE_VISION_LAYERS}" >&2; exit 1 ;;
 esac
 
 docker run --rm "${DOCKER_TTY_ARGS[@]}" \
@@ -290,9 +187,6 @@ docker run --rm "${DOCKER_TTY_ARGS[@]}" \
   -e TRANSFORMERS_CACHE=/cache/huggingface \
   -e FORCE_UNSLOTH_VIDEO_READER="${VIDEO_READER}" \
   -e PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}" \
-  -e UNSLOTH_RETURN_LOGITS="${UNSLOTH_RETURN_LOGITS:-}" \
-  -e UNSLOTH_RETURN_HIDDEN_STATES="${UNSLOTH_RETURN_HIDDEN_STATES:-}" \
-  -e UNSLOTH_COMPILE_LOCATION="${UNSLOTH_COMPILE_LOCATION:-}" \
   -e WANDB_DIR="${WANDB_DIR}" \
   -e WANDB_PROJECT="${WANDB_PROJECT:-qwen-omd}" \
   -e WANDB_MODE="${WANDB_MODE:-online}" \

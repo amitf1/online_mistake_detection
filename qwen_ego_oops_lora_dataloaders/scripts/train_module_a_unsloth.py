@@ -7,6 +7,7 @@ import gc
 import inspect
 import json
 import math
+import os
 import random
 import shutil
 import subprocess
@@ -29,7 +30,11 @@ from qwen_omd_dataloaders.config import ModuleAConfig  # noqa: E402
 from qwen_omd_dataloaders.datasets import EgoOopsModuleADataset, EgoOopsProvider  # noqa: E402
 from qwen_omd_dataloaders.schema import TrainingExample  # noqa: E402
 
-MODULE_A_SYSTEM_PROMPT = "You are an online procedural step completion detector."
+MODULE_A_SYSTEM_PROMPT = (
+    "You review a person following procedural instructions. Given the video, completed steps, "
+    "current step, and pending steps, answer WAIT or COMPLETE. Say COMPLETE when the attempt at "
+    "the current step has ended, even if it included mistakes; otherwise say WAIT."
+)
 DEFAULT_OUTPUT_DIR = "/home/amit/online_mistake_detection/outputs/module_a_qwen35_2b_lora_wait_complete_vision"
 MODULE_A_SPLIT_VERSION = 1
 MODULE_A_LABELS = ("WAIT", "COMPLETE")
@@ -44,6 +49,43 @@ def release_cuda_memory() -> None:
         return
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def configure_unsloth_logits(args: argparse.Namespace) -> None:
+    if args.positive_loss_weight != 1.0 or args.label_score_eval:
+        os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
+        os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
+        os.environ.setdefault("UNSLOTH_COMPILE_LOCATION", "/tmp/unsloth_compiled_cache_module_a_logits")
+        print(
+            "Unsloth logits/hidden states enabled for weighted loss / label scoring "
+            f"(compile cache: {os.environ['UNSLOTH_COMPILE_LOCATION']})."
+        )
+
+
+def logits_for_loss(model: Any, outputs: Any) -> Any:
+    import torch
+
+    logits = outputs.logits
+    output_embeddings = model.get_output_embeddings()
+    vocab_size = getattr(output_embeddings, "out_features", None)
+    if torch.is_tensor(logits) and logits.ndim >= 3 and (vocab_size is None or logits.shape[-1] == vocab_size):
+        return logits
+    if torch.is_tensor(logits) and logits.ndim >= 3:
+        logits = output_embeddings(logits)
+        return logits
+
+    hidden_states = getattr(outputs, "hidden_states", None)
+    if isinstance(hidden_states, list | tuple) and hidden_states:
+        hidden_states = hidden_states[-1]
+    if torch.is_tensor(hidden_states):
+        weight = getattr(output_embeddings, "weight", None)
+        if torch.is_tensor(weight):
+            hidden_states = hidden_states.to(dtype=weight.dtype)
+        return output_embeddings(hidden_states)
+    raise RuntimeError(
+        "Could not obtain logits or hidden states from Unsloth output. "
+        "Weighted positive loss requires UNSLOTH_RETURN_LOGITS=1 or output_hidden_states=True."
+    )
 
 
 def generation_eval_examples(
@@ -115,6 +157,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--completion-margin", type=float, default=0.10)
     parser.add_argument("--negative-to-positive-ratio", type=int, default=2)
     parser.add_argument("--keep-last-wait-windows", type=int, default=2)
+    parser.add_argument(
+        "--positive-oversample-factor",
+        type=float,
+        default=1.0,
+        help="Train-only COMPLETE oversampling factor. 1.0 keeps the natural split.",
+    )
+    parser.add_argument(
+        "--positive-loss-weight",
+        type=float,
+        default=1.0,
+        help="Train-time loss multiplier for COMPLETE assistant response tokens.",
+    )
 
     # Model / LoRA
     parser.add_argument("--model-name", default="unsloth/Qwen3.5-2B")
@@ -218,6 +272,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-checkpoint", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--generation-eval-output-json", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--eval-generation-max-new-tokens", type=int, default=8)
+    parser.add_argument(
+        "--label-score-eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Evaluate Module A by comparing WAIT/COMPLETE label likelihoods instead of generation.",
+    )
+    parser.add_argument("--fbeta-beta", type=float, default=2.0)
     parser.add_argument("--early-stopping-patience", type=int, default=3)
     parser.add_argument("--early-stopping-threshold", type=float, default=0.0)
     parser.add_argument("--metric-for-best-model", default="eval_loss")
@@ -262,6 +323,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--keep-last-checkpoints cannot be negative.")
     if args.keep_best_checkpoints < 0:
         parser.error("--keep-best-checkpoints cannot be negative.")
+    if args.positive_oversample_factor < 1.0:
+        parser.error("--positive-oversample-factor must be >= 1.0.")
+    if args.positive_loss_weight <= 0:
+        parser.error("--positive-loss-weight must be positive.")
+    if args.fbeta_beta <= 0:
+        parser.error("--fbeta-beta must be positive.")
     if args.greater_is_better is None:
         args.greater_is_better = not args.metric_for_best_model.endswith("loss")
     return args
@@ -446,6 +513,45 @@ def split_conversations(
     return train, val
 
 
+def oversample_positive_conversations(
+    conversations: list[dict[str, Any]],
+    *,
+    factor: float,
+    seed: int,
+) -> list[dict[str, Any]]:
+    if factor <= 1.0:
+        return list(conversations)
+    positives = [
+        item for item in conversations
+        if label_to_positive(str(item.get("target", "")))
+    ]
+    if not positives:
+        return list(conversations)
+
+    extra_count = int(math.floor((factor - 1.0) * len(positives)))
+    fractional = (factor - 1.0) * len(positives) - extra_count
+    rng = random.Random(seed)
+    if fractional > 0 and rng.random() < fractional:
+        extra_count += 1
+    extras = [copy.deepcopy(rng.choice(positives)) for _ in range(extra_count)]
+    expanded = list(conversations) + extras
+    rng.shuffle(expanded)
+    return expanded
+
+
+def apply_positive_loss_weights(
+    conversations: list[dict[str, Any]],
+    *,
+    positive_weight: float,
+) -> None:
+    for item in conversations:
+        item["loss_weight"] = (
+            positive_weight
+            if label_to_positive(str(item.get("target", "")))
+            else 1.0
+        )
+
+
 def to_unsloth_conversations(
     dataset: EgoOopsModuleADataset,
     *,
@@ -516,6 +622,7 @@ def training_example_to_conversation(
         "window_start": example.window_start,
         "window_end": example.window_end,
         "target": example.target_text,
+        "loss_weight": 1.0,
     }
 
 
@@ -626,6 +733,7 @@ def binary_detection_metrics(
     predictions: list[str],
     *,
     prefix: str,
+    beta: float = 2.0,
 ) -> dict[str, float]:
     tp = fp = tn = fn = 0
     for target, prediction in zip(targets, predictions):
@@ -646,6 +754,11 @@ def binary_detection_metrics(
     specificity = tn / (tn + fp) if tn + fp else 0.0
     accuracy = (tp + tn) / total if total else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    beta_sq = beta * beta
+    fbeta = (
+        (1 + beta_sq) * precision * recall / ((beta_sq * precision) + recall)
+        if precision + recall else 0.0
+    )
     balanced_accuracy = (recall + specificity) / 2.0
     denominator = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
     mcc = ((tp * tn) - (fp * fn)) / denominator if denominator else 0.0
@@ -655,6 +768,7 @@ def binary_detection_metrics(
         f"{prefix}/precision": precision,
         f"{prefix}/recall": recall,
         f"{prefix}/f1": f1,
+        f"{prefix}/f_beta": fbeta,
         f"{prefix}/specificity": specificity,
         f"{prefix}/balanced_accuracy": balanced_accuracy,
         f"{prefix}/mcc": mcc,
@@ -746,10 +860,11 @@ def collapse_fps(fps_values: list[float], tol: float = 1e-4) -> float | list[flo
 class Qwen3VLMetadataVisionDataCollator:
     """Unsloth vision collator wrapper that preserves Qwen3-VL video metadata."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, include_response_loss_weight: bool = False, **kwargs: Any) -> None:
         from unsloth.trainer import UnslothVisionDataCollator
 
         self._base = UnslothVisionDataCollator(*args, **kwargs)
+        self.include_response_loss_weight = include_response_loss_weight
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base, name)
@@ -871,6 +986,14 @@ class Qwen3VLMetadataVisionDataCollator:
         batch["labels"] = labels
         if self._base.train_on_responses_only:
             batch["labels"] = self._base.train_on_responses_only(batch)["labels"]
+        if self.include_response_loss_weight:
+            weights = torch.tensor(
+                [float(example.get("loss_weight", 1.0)) for example in examples],
+                dtype=torch.float32,
+                device=batch["labels"].device,
+            )
+            response_mask = (batch["labels"] != self._base.ignore_index).to(torch.float32)
+            batch["response_loss_weight"] = response_mask * weights[:, None]
         return batch
 
 
@@ -883,6 +1006,8 @@ class ModuleADetectionMetricsCallback:
         tokenizer: Any,
         max_samples: int,
         max_new_tokens: int,
+        beta: float,
+        label_score_eval: bool,
     ) -> None:
         from transformers import TrainerCallback
 
@@ -892,6 +1017,8 @@ class ModuleADetectionMetricsCallback:
         self.data_collator = data_collator
         self.tokenizer = tokenizer
         self.max_new_tokens = max_new_tokens
+        self.beta = beta
+        self.label_score_eval = label_score_eval
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._callback_base, name)
@@ -914,8 +1041,11 @@ class ModuleADetectionMetricsCallback:
         try:
             with torch.inference_mode():
                 for example in self.eval_examples:
-                    generated_text = self._generate_label(model, example)
-                    prediction = extract_module_a_label(generated_text)
+                    if self.label_score_eval:
+                        prediction = self._score_label(model, example)
+                    else:
+                        generated_text = self._generate_label(model, example)
+                        prediction = extract_module_a_label(generated_text)
                     target = str(example["target"])
                     task_id = str(example["task_id"])
                     predictions.append(prediction)
@@ -927,12 +1057,13 @@ class ModuleADetectionMetricsCallback:
                 FastVisionModel.for_training(model)
             release_cuda_memory()
 
-        metrics = binary_detection_metrics(targets, predictions, prefix="eval_detection")
+        metrics = binary_detection_metrics(targets, predictions, prefix="eval_detection", beta=self.beta)
         for task_id in sorted(task_targets):
             task_metrics = binary_detection_metrics(
                 task_targets[task_id],
                 task_predictions[task_id],
                 prefix=f"eval_detection/task_{task_id}",
+                beta=self.beta,
             )
             metrics.update({
                 key: value
@@ -1002,6 +1133,46 @@ class ModuleADetectionMetricsCallback:
                 del generated_ids
             release_cuda_memory()
 
+    def _score_label(self, model: Any, example: dict[str, Any]) -> str:
+        import torch
+
+        scores = {}
+        device = next(model.parameters()).device
+        for label in MODULE_A_LABELS:
+            scored_example = copy.deepcopy(example)
+            for message in scored_example["messages"]:
+                if message.get("role") == "assistant":
+                    message["content"] = [{"type": "text", "text": label}]
+                    break
+            batch = self.data_collator([scored_example])
+            inputs = {
+                key: value.to(device) if hasattr(value, "to") else value
+                for key, value in batch.items()
+            }
+            inputs.pop("response_loss_weight", None)
+            labels = inputs.get("labels")
+            try:
+                with torch.inference_mode():
+                    outputs = model(**inputs, output_hidden_states=True, return_dict=True)
+                logits = logits_for_loss(model, outputs)[:, :-1, :].float()
+                shift_labels = labels[:, 1:]
+                loss = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    shift_labels.reshape(-1),
+                    ignore_index=-100,
+                    reduction="sum",
+                )
+                token_count = (shift_labels != -100).sum().clamp_min(1)
+                scores[label] = float((loss / token_count).detach().cpu())
+            finally:
+                del inputs
+                if "outputs" in locals():
+                    del outputs
+                if "logits" in locals():
+                    del logits
+                release_cuda_memory()
+        return min(scores, key=scores.get)
+
 
 def compute_generation_detection_metrics(
     *,
@@ -1026,6 +1197,8 @@ def compute_generation_detection_metrics(
         tokenizer=tokenizer,
         max_samples=args.eval_generation_max_samples,
         max_new_tokens=args.eval_generation_max_new_tokens,
+        beta=args.fbeta_beta,
+        label_score_eval=args.label_score_eval,
     )
     predictions: list[str] = []
     targets: list[str] = []
@@ -1033,8 +1206,11 @@ def compute_generation_detection_metrics(
     task_predictions: dict[str, list[str]] = defaultdict(list)
 
     for example in generator.eval_examples:
-        generated_text = generator._generate_label(model, example)
-        prediction = extract_module_a_label(generated_text)
+        if args.label_score_eval:
+            prediction = generator._score_label(model, example)
+        else:
+            generated_text = generator._generate_label(model, example)
+            prediction = extract_module_a_label(generated_text)
         target = str(example["target"])
         task_id = str(example["task_id"])
         predictions.append(prediction)
@@ -1042,12 +1218,13 @@ def compute_generation_detection_metrics(
         task_predictions[task_id].append(prediction)
         task_targets[task_id].append(target)
 
-    metrics = binary_detection_metrics(targets, predictions, prefix="eval_detection")
+    metrics = binary_detection_metrics(targets, predictions, prefix="eval_detection", beta=args.fbeta_beta)
     for task_id in sorted(task_targets):
         task_metrics = binary_detection_metrics(
             task_targets[task_id],
             task_predictions[task_id],
             prefix=f"eval_detection/task_{task_id}",
+            beta=args.fbeta_beta,
         )
         metrics.update({
             key: value
@@ -1101,6 +1278,8 @@ def build_generation_eval_command(
         str(args.eval_generation_max_samples),
         "--eval-generation-max-new-tokens",
         str(args.eval_generation_max_new_tokens),
+        "--fbeta-beta",
+        str(args.fbeta_beta),
         "--output-dir",
         str(args.output_dir),
         "--seed",
@@ -1116,6 +1295,7 @@ def build_generation_eval_command(
         command.extend(str(item) for item in args.task_ids)
     command.append("--load-in-4bit" if args.load_in_4bit else "--no-load-in-4bit")
     command.append("--load-in-16bit" if args.load_in_16bit else "--no-load-in-16bit")
+    command.append("--label-score-eval" if args.label_score_eval else "--no-label-score-eval")
     return command
 
 
@@ -1407,6 +1587,41 @@ def build_trainer(
     from trl import SFTConfig, SFTTrainer
     from unsloth import FastVisionModel
 
+    class WeightedSFTTrainer(SFTTrainer):
+        def compute_loss(
+            self,
+            model: Any,
+            inputs: dict[str, Any],
+            return_outputs: bool = False,
+            num_items_in_batch: Any | None = None,
+        ) -> Any:
+            import torch
+
+            response_loss_weight = inputs.pop("response_loss_weight", None)
+            if response_loss_weight is None:
+                return super().compute_loss(
+                    model,
+                    inputs,
+                    return_outputs=return_outputs,
+                    num_items_in_batch=num_items_in_batch,
+                )
+
+            labels = inputs.get("labels")
+            outputs = model(**inputs, output_hidden_states=True, return_dict=True)
+            logits = logits_for_loss(model, outputs)[:, :-1, :].float()
+            shift_labels = labels[:, 1:]
+            shift_weights = response_loss_weight[:, 1:].to(logits.device)
+            token_loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                shift_labels.reshape(-1),
+                ignore_index=-100,
+                reduction="none",
+            ).reshape_as(shift_labels)
+            weighted_loss = token_loss * shift_weights
+            denominator = shift_weights.sum().clamp_min(1.0)
+            loss = weighted_loss.sum() / denominator
+            return (loss, outputs) if return_outputs else loss
+
     FastVisionModel.for_training(model)
     bf16 = is_bf16_available()
     hf_train_dataset = Dataset.from_list(train_dataset)
@@ -1453,6 +1668,7 @@ def build_trainer(
         instruction_part="<|im_start|>user\n",
         response_part="<|im_start|>assistant\n",
         completion_only_loss=True,
+        include_response_loss_weight=args.positive_loss_weight != 1.0,
     )
     detection_callback: ModuleADetectionMetricsCallback | None = None
     if args.generation_eval_mode == "inline" and args.eval_generation_max_samples != 0:
@@ -1462,6 +1678,8 @@ def build_trainer(
             tokenizer=tokenizer,
             max_samples=args.eval_generation_max_samples,
             max_new_tokens=args.eval_generation_max_new_tokens,
+            beta=args.fbeta_beta,
+            label_score_eval=args.label_score_eval,
         )
         callbacks.append(detection_callback)
     checkpoint_callback = EpochCheckpointCallback(
@@ -1479,7 +1697,8 @@ def build_trainer(
         generation_eval_args=args,
     )
     callbacks.append(checkpoint_callback)
-    trainer = SFTTrainer(
+    trainer_cls = WeightedSFTTrainer if args.positive_loss_weight != 1.0 else SFTTrainer
+    trainer = trainer_cls(
         model=model,
         tokenizer=tokenizer,
         train_dataset=hf_train_dataset,
@@ -1541,6 +1760,7 @@ def run_generation_eval_only(
 
 def main() -> None:
     args = parse_args()
+    configure_unsloth_logits(args)
     dataset = build_module_a_dataset(args)
     conversations = to_unsloth_conversations(
         dataset,
@@ -1553,6 +1773,16 @@ def main() -> None:
         raise SystemExit("Module A dataset produced no conversations.")
     split, split_path = load_or_create_video_split(dataset, args)
     train_conversations, val_conversations = split_conversations(conversations, split)
+    train_conversations = oversample_positive_conversations(
+        train_conversations,
+        factor=args.positive_oversample_factor,
+        seed=args.seed,
+    )
+    apply_positive_loss_weights(
+        train_conversations,
+        positive_weight=args.positive_loss_weight,
+    )
+    apply_positive_loss_weights(val_conversations, positive_weight=1.0)
     if args.generation_eval_only:
         run_generation_eval_only(args=args, val_conversations=val_conversations)
         return

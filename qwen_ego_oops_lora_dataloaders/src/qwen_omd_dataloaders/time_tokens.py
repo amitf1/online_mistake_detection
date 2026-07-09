@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from .config import TimeTokenConfig
 
 
@@ -47,3 +49,21 @@ def render_time_span_target(
         config=config,
     )
     return f"{start_token} to {end_token}"
+
+
+def render_seconds_span_target(
+    *,
+    gt_start: float,
+    gt_end: float,
+    window_start: float,
+    precision: int = 2,
+) -> str:
+    start = max(0.0, gt_start - window_start)
+    end = max(start, gt_end - window_start)
+    payload = {
+        "relevant_windows": [[
+            f"{start:.{precision}f}",
+            f"{end:.{precision}f}",
+        ]]
+    }
+    return json.dumps(payload, separators=(",", ":"))

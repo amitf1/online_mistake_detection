@@ -5,6 +5,8 @@
 .env
 .env.*
 !.env.example
+!.env.module_a
+!.env.module_b
 
 qwen_ego_oops_lora_dataloaders/src/qwen_omd_dataloaders/__pycache__/__init__.cpython-312.pyc
 qwen_ego_oops_lora_dataloaders/src/qwen_omd_dataloaders/__pycache__/build.cpython-312.pyc
