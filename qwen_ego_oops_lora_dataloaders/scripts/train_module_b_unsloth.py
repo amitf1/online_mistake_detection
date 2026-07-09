@@ -52,6 +52,14 @@ MODULE_B_SYSTEM_PROMPT = (
 
 
 def disable_unsloth_extra_outputs() -> None:
+    was_logits = os.environ.get("UNSLOTH_RETURN_LOGITS")
+    was_hidden = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES")
+    if was_logits == "1" or was_hidden == "1":
+        print(
+            "Module B disabled leaked Unsloth extra outputs: "
+            f"UNSLOTH_RETURN_LOGITS={was_logits}, "
+            f"UNSLOTH_RETURN_HIDDEN_STATES={was_hidden}"
+        )
     os.environ["UNSLOTH_RETURN_LOGITS"] = "0"
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
@@ -462,6 +470,7 @@ class ModuleBTemporalMetricsCallback:
         finally:
             if was_training:
                 FastVisionModel.for_training(model)
+            disable_unsloth_extra_outputs()
             release_cuda_memory()
 
         metrics = temporal_metrics(targets, predictions, labels)
@@ -560,7 +569,7 @@ def build_trainer(
     bf16 = is_bf16_available()
     hf_train_dataset = Dataset.from_list(train_dataset)
     hf_eval_dataset = Dataset.from_list(eval_dataset)
-    callbacks: list[TrainerCallback] = [ModuleBUnslothEnvGuardCallback()]
+    callbacks: list[TrainerCallback] = []
     trainer_args = dict(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
@@ -629,6 +638,7 @@ def build_trainer(
         ),
     )
     callbacks.append(checkpoint_callback)
+    callbacks.append(ModuleBUnslothEnvGuardCallback())
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
