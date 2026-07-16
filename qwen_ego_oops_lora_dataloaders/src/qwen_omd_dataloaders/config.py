@@ -34,6 +34,7 @@ class ModuleBConfig:
 
 @dataclass(frozen=True)
 class ModuleCConfig:
+    min_duration_seconds: float = 0.5
     jitter_ratio_min: float = 0.05
     jitter_ratio_max: float = 0.10
     seed: int = 19

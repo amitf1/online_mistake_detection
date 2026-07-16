@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import json
 import math
@@ -26,8 +27,8 @@ from qwen_omd_dataloaders.build import (  # noqa: E402
     DEFAULT_MISTAKE_CLASSES_PATH,
     DEFAULT_VIDEO_ROOT,
 )
-from qwen_omd_dataloaders.config import ModuleAConfig, ModuleBConfig  # noqa: E402
-from qwen_omd_dataloaders.datasets import EgoOopsModuleBDataset, EgoOopsProvider  # noqa: E402
+from qwen_omd_dataloaders.config import ModuleCConfig  # noqa: E402
+from qwen_omd_dataloaders.datasets import EgoOopsModuleCDataset, EgoOopsProvider  # noqa: E402
 from qwen_omd_dataloaders.schema import TrainingExample  # noqa: E402
 
 from train_module_a_unsloth import (  # noqa: E402
@@ -37,18 +38,18 @@ from train_module_a_unsloth import (  # noqa: E402
     is_bf16_available,
     json_safe,
     load_unsloth_model,
-    make_video_split,
     release_cuda_memory,
     save_outputs,
     validate_lora_target_configuration,
     validate_video_split,
 )
 
-MODULE_B_SYSTEM_PROMPT = (
-    "You are a temporal grounding model. Locate the requested instruction in the provided video clip. "
-    "If the instruction attempt is visible, return JSON only as "
-    "{\"relevant_windows\":[[\"start_seconds\",\"end_seconds\"]]} using seconds relative to the start of the clip. "
-    "If the instruction attempt is not completed in the clip, return not completed."
+MODULE_C_SPLIT_VERSION = "module_c_video_split_v1"
+MODULE_C_SYSTEM_PROMPT = (
+    "You are a video mistake-detection and reasoning model. Compare the visible execution in the "
+    "provided bounded clip to the written instruction. Decide whether there is a procedural mistake, "
+    "then explain the visual evidence briefly. Return strict compact JSON only, with exactly these keys: "
+    "{\"mistake\":true|false,\"reasoning\":\"short explanation\"}. Do not include markdown or extra text."
 )
 
 
@@ -57,7 +58,7 @@ def disable_unsloth_extra_outputs() -> None:
     was_hidden = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES")
     if was_logits == "1" or was_hidden == "1":
         print(
-            "Module B disabled leaked Unsloth extra outputs: "
+            "Module C disabled leaked Unsloth extra outputs: "
             f"UNSLOTH_RETURN_LOGITS={was_logits}, "
             f"UNSLOTH_RETURN_HIDDEN_STATES={was_hidden}"
         )
@@ -66,7 +67,7 @@ def disable_unsloth_extra_outputs() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Fine-tune Qwen VL for Module B temporal grounding.")
+    parser = argparse.ArgumentParser(description="Fine-tune Qwen VL for Module C mistake reasoning.")
     parser.add_argument("--metadata", default=DEFAULT_METADATA_PATH)
     parser.add_argument("--mistake-classes", default=DEFAULT_MISTAKE_CLASSES_PATH)
     parser.add_argument("--video-root", default=DEFAULT_VIDEO_ROOT)
@@ -80,8 +81,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--finetune-language-layers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--finetune-attention-modules", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--finetune-mlp-modules", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--lora-r", type=int, default=16)
-    parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument("--lora-r", type=int, default=32)
+    parser.add_argument("--lora-alpha", type=int, default=64)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument(
         "--lora-target-modules",
@@ -92,9 +93,6 @@ def parse_args() -> argparse.Namespace:
             "'all-linear' targets every linear layer and requires all finetune_* flags to be true."
         ),
     )
-    parser.add_argument("--bias", default="none")
-    parser.add_argument("--use-rslora", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--loftq-config", default=None)
     parser.add_argument("--train-mode", choices=["steps", "epochs"], default="steps")
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--num-train-epochs", type=float, default=3.0)
@@ -113,31 +111,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-best-checkpoints", type=int, default=4)
     parser.add_argument("--early-stopping-patience", type=int, default=3)
     parser.add_argument("--early-stopping-threshold", type=float, default=0.0)
-    parser.add_argument("--metric-for-best-model", default="eval_temporal/mean_iou")
+    parser.add_argument("--metric-for-best-model", default="eval_mistake/f1")
     parser.add_argument("--greater-is-better", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--val-videos-per-task", type=int, default=2)
     parser.add_argument("--split-file", default=None)
     parser.add_argument("--regenerate-split", action="store_true")
-    parser.add_argument("--stride-seconds", type=float, default=2.0)
-    parser.add_argument("--completion-margin", type=float, default=0.25)
-    parser.add_argument("--negative-to-positive-ratio", type=int, default=2)
-    parser.add_argument("--keep-last-wait-windows", type=int, default=2)
-    parser.add_argument("--module-b-pre-pad-ratio-min", type=float, default=0.25)
-    parser.add_argument("--module-b-pre-pad-ratio-max", type=float, default=0.75)
-    parser.add_argument("--module-b-post-pad-ratio-min", type=float, default=0.25)
-    parser.add_argument("--module-b-post-pad-ratio-max", type=float, default=0.75)
-    parser.add_argument("--include-incomplete-negatives", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--module-b-negative-ratio", type=float, default=0.25)
+    parser.add_argument("--module-c-min-duration-seconds", type=float, default=0.5)
+    parser.add_argument("--module-c-jitter-ratio-min", type=float, default=0.05)
+    parser.add_argument("--module-c-jitter-ratio-max", type=float, default=0.10)
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--min-frames", type=int, default=2)
     parser.add_argument("--max-frames", type=int, default=32)
     parser.add_argument("--eval-max-frames", type=int, default=None)
     parser.add_argument("--vision-resize", type=int, default=512)
-    parser.add_argument("--max-seq-length", type=int, default=6144)
+    parser.add_argument("--max-seq-length", type=int, default=8192)
     parser.add_argument("--eval-generation-max-samples", type=int, default=-1)
-    parser.add_argument("--eval-generation-max-new-tokens", type=int, default=64)
-    parser.add_argument("--output-dir", default="outputs/module_b_qwen35_lora_grounding")
+    parser.add_argument("--eval-generation-max-new-tokens", type=int, default=128)
+    parser.add_argument("--output-dir", default="outputs/module_c_qwen35_lora_reasoning")
     parser.add_argument("--report-to", default="tensorboard")
     parser.add_argument("--dataset-num-proc", type=int, default=1)
     parser.add_argument("--seed", type=int, default=3407)
@@ -145,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--print-examples", type=int, default=2)
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument("--wandb-log-best-checkpoints", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--wandb-artifact-prefix", default="module-b")
+    parser.add_argument("--wandb-artifact-prefix", default="module-c")
     args = parser.parse_args()
     args.report_to = [item.strip() for item in args.report_to.split(",") if item.strip()]
     if args.max_videos <= 0:
@@ -154,13 +145,19 @@ def parse_args() -> argparse.Namespace:
         args.eval_max_frames = args.max_frames
     if args.max_frames < args.min_frames or args.eval_max_frames < args.min_frames:
         parser.error("--max-frames and --eval-max-frames must be >= --min-frames.")
+    if args.module_c_min_duration_seconds <= 0:
+        parser.error("--module-c-min-duration-seconds must be positive.")
+    if args.module_c_jitter_ratio_min < 0 or args.module_c_jitter_ratio_max < args.module_c_jitter_ratio_min:
+        parser.error("Module C jitter ratios must be non-negative and min <= max.")
     if args.keep_last_checkpoints < 0 or args.keep_best_checkpoints < 0:
         parser.error("checkpoint retention counts cannot be negative.")
+    if args.eval_generation_max_samples < -1:
+        parser.error("--eval-generation-max-samples must be -1, 0, or positive.")
     validate_lora_target_configuration(args, parser.error)
     return args
 
 
-def build_module_b_dataset(args: argparse.Namespace) -> EgoOopsModuleBDataset:
+def build_module_c_dataset(args: argparse.Namespace) -> EgoOopsModuleCDataset:
     provider = EgoOopsProvider(
         metadata_path=args.metadata,
         mistake_classes_path=args.mistake_classes,
@@ -170,57 +167,92 @@ def build_module_b_dataset(args: argparse.Namespace) -> EgoOopsModuleBDataset:
         max_videos=args.max_videos,
         require_existing_videos=True,
     )
-    module_a_config = ModuleAConfig(
-        stride_seconds=args.stride_seconds,
-        completion_margin=args.completion_margin,
-        negative_to_positive_ratio=args.negative_to_positive_ratio,
-        keep_last_wait_windows=args.keep_last_wait_windows,
+    config = ModuleCConfig(
+        min_duration_seconds=args.module_c_min_duration_seconds,
+        jitter_ratio_min=args.module_c_jitter_ratio_min,
+        jitter_ratio_max=args.module_c_jitter_ratio_max,
         seed=args.seed,
     )
-    module_b_config = ModuleBConfig(
-        pre_pad_ratio_min=args.module_b_pre_pad_ratio_min,
-        pre_pad_ratio_max=args.module_b_pre_pad_ratio_max,
-        post_pad_ratio_min=args.module_b_post_pad_ratio_min,
-        post_pad_ratio_max=args.module_b_post_pad_ratio_max,
-        include_incomplete_negatives=args.include_incomplete_negatives,
-        negative_ratio=args.module_b_negative_ratio,
-        seed=args.seed,
-    )
-    return EgoOopsModuleBDataset(provider, module_a_config=module_a_config, config=module_b_config)
+    return EgoOopsModuleCDataset(provider, config=config)
 
 
 def default_split_file(args: argparse.Namespace) -> Path:
-    return PROJECT_ROOT / "splits" / f"module_b_video_split_seed{args.seed}.json"
+    return PROJECT_ROOT / "splits" / f"module_c_video_split_seed{args.seed}.json"
 
 
-def load_or_create_video_split(dataset: EgoOopsModuleBDataset, args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
+def split_policy(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "type": "per_task_video_holdout",
+        "val_fraction": args.val_fraction,
+        "val_videos_per_task": args.val_videos_per_task,
+    }
+
+
+def data_config_for_split(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "max_videos": args.max_videos,
+        "task_ids": sorted(args.task_ids or []),
+        "video_ids": sorted(args.video_ids or []),
+        "module_c_min_duration_seconds": args.module_c_min_duration_seconds,
+        "module_c_jitter_ratio_min": args.module_c_jitter_ratio_min,
+        "module_c_jitter_ratio_max": args.module_c_jitter_ratio_max,
+    }
+
+
+def make_module_c_video_split(dataset: EgoOopsModuleCDataset, args: argparse.Namespace) -> dict[str, Any]:
+    grouped = grouped_video_ids(dataset)
+    if not grouped:
+        raise ValueError("Cannot create a split from an empty dataset.")
+
+    import random
+
+    rng = random.Random(args.seed)
+    tasks: dict[str, dict[str, list[str]]] = {}
+    train_video_ids: list[str] = []
+    val_video_ids: list[str] = []
+    for task_id, video_ids in grouped.items():
+        shuffled = list(video_ids)
+        rng.shuffle(shuffled)
+        if len(shuffled) < 2:
+            raise ValueError(f"Task {task_id!r} has too few videos for validation splitting.")
+        val_count = min(args.val_videos_per_task, len(shuffled) - 1)
+        if len(grouped) != 5 or len(shuffled) != 10:
+            val_count = max(1, round(len(shuffled) * args.val_fraction))
+            val_count = min(val_count, len(shuffled) - 1)
+        val = sorted(shuffled[:val_count])
+        train = sorted(shuffled[val_count:])
+        tasks[task_id] = {"train": train, "val": val}
+        train_video_ids.extend(train)
+        val_video_ids.extend(val)
+
+    return {
+        "version": MODULE_C_SPLIT_VERSION,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "seed": args.seed,
+        "split_policy": split_policy(args),
+        "metadata_path": str(Path(args.metadata).resolve()),
+        "video_root": str(Path(args.video_root).resolve()),
+        "data_config": data_config_for_split(args),
+        "train_video_ids": sorted(train_video_ids),
+        "val_video_ids": sorted(val_video_ids),
+        "tasks": tasks,
+    }
+
+
+def load_or_create_video_split(dataset: EgoOopsModuleCDataset, args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     split_path = Path(args.split_file) if args.split_file else default_split_file(args)
     if split_path.exists() and not args.regenerate_split:
         with open(split_path, "r", encoding="utf-8") as file:
             split = json.load(file)
         validate_video_split(split, dataset)
         return split, split_path
-    split = make_video_split(dataset, args)
-    split["version"] = "module_b_video_split_v1"
-    split["created_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    split = make_module_c_video_split(dataset, args)
+    validate_video_split(split, dataset)
     split_path.parent.mkdir(parents=True, exist_ok=True)
     with open(split_path, "w", encoding="utf-8") as file:
         json.dump(split, file, indent=2, sort_keys=True)
         file.write("\n")
     return split, split_path
-
-
-def to_unsloth_conversations(
-    dataset: EgoOopsModuleBDataset,
-    *,
-    fps: float,
-    min_frames: int,
-    max_frames: int,
-) -> list[dict[str, Any]]:
-    return [
-        training_example_to_conversation(example, fps=fps, min_frames=min_frames, max_frames=max_frames)
-        for example in dataset
-    ]
 
 
 def training_example_to_conversation(
@@ -232,7 +264,7 @@ def training_example_to_conversation(
 ) -> dict[str, Any]:
     return {
         "messages": [
-            {"role": "system", "content": [{"type": "text", "text": MODULE_B_SYSTEM_PROMPT}]},
+            {"role": "system", "content": [{"type": "text", "text": MODULE_C_SYSTEM_PROMPT}]},
             {
                 "role": "user",
                 "content": [
@@ -259,25 +291,14 @@ def training_example_to_conversation(
         "gt_end": example.gt_end,
         "target": example.target_text,
         "label": example.label,
+        "mistake": example.mistake,
+        "reasoning": example.reasoning,
         "metadata": example.metadata,
     }
 
 
-def split_conversations(
-    conversations: list[dict[str, Any]],
-    split: dict[str, Any],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    train_ids = set(split["train_video_ids"])
-    val_ids = set(split["val_video_ids"])
-    train = [item for item in conversations if item["video_id"] in train_ids]
-    val = [item for item in conversations if item["video_id"] in val_ids]
-    if not train or not val:
-        raise ValueError("Train/validation split produced an empty conversation split.")
-    return train, val
-
-
 def conversations_for_video_ids(
-    dataset: EgoOopsModuleBDataset,
+    dataset: EgoOopsModuleCDataset,
     video_ids: set[str],
     *,
     fps: float,
@@ -291,7 +312,7 @@ def conversations_for_video_ids(
     ]
 
 
-def summarize_dataset(dataset: EgoOopsModuleBDataset) -> dict[str, Any]:
+def summarize_dataset(dataset: EgoOopsModuleCDataset) -> dict[str, Any]:
     labels = Counter(example.label for example in dataset)
     return {
         "num_examples": len(dataset),
@@ -315,8 +336,7 @@ def summarize_conversations(conversations: list[dict[str, Any]]) -> dict[str, An
 def save_run_config(
     *,
     args: argparse.Namespace,
-    dataset: EgoOopsModuleBDataset,
-    conversations: list[dict[str, Any]],
+    dataset: EgoOopsModuleCDataset,
     train_conversations: list[dict[str, Any]],
     val_conversations: list[dict[str, Any]],
     split: dict[str, Any],
@@ -327,7 +347,7 @@ def save_run_config(
     payload = {
         "args": json_safe(vars(args)),
         "dataset_summary": summarize_dataset(dataset),
-        "num_conversations": len(conversations),
+        "num_conversations": len(train_conversations) + len(val_conversations),
         "split_file": str(split_path),
         "split": json_safe(split),
         "train_summary": summarize_conversations(train_conversations),
@@ -340,118 +360,119 @@ def save_run_config(
     print(f"Saved run config to: {config_path}")
 
 
-def parse_temporal_prediction(text: str) -> tuple[float, float] | None:
+def parse_bool_value(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1", "mistake"}:
+            return True
+        if normalized in {"false", "no", "0", "correct"}:
+            return False
+    return None
+
+
+def parse_module_c_prediction(text: str) -> dict[str, Any] | None:
     cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
     match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
     if match:
         cleaned = match.group(0)
     try:
         payload = json.loads(cleaned)
     except json.JSONDecodeError:
-        numbers = [float(item) for item in re.findall(r"\d+(?:\.\d+)?", cleaned)]
-        if len(numbers) >= 2:
-            return normalize_span(numbers[0], numbers[1])
         return None
-
-    windows = payload.get("relevant_windows")
-    if isinstance(windows, list) and windows:
-        first = windows[0]
-        if isinstance(first, list | tuple) and len(first) >= 2:
-            return normalize_span(first[0], first[1])
-    if "start_time" in payload and "end_time" in payload:
-        return normalize_span(payload["start_time"], payload["end_time"])
-    return None
-
-
-def normalize_span(start: Any, end: Any) -> tuple[float, float] | None:
-    try:
-        parsed_start = float(start)
-        parsed_end = float(end)
-    except (TypeError, ValueError):
+    if not isinstance(payload, dict):
         return None
-    if parsed_start < 0 or parsed_end < parsed_start:
+    mistake = parse_bool_value(payload.get("mistake"))
+    reasoning = payload.get("reasoning")
+    if mistake is None or not isinstance(reasoning, str) or not reasoning.strip():
         return None
-    return parsed_start, parsed_end
+    return {"mistake": mistake, "reasoning": reasoning.strip()}
 
 
-def temporal_iou(pred: tuple[float, float], target: tuple[float, float]) -> float:
-    start = max(pred[0], target[0])
-    end = min(pred[1], target[1])
-    intersection = max(0.0, end - start)
-    union = max(pred[1], target[1]) - min(pred[0], target[0])
-    return intersection / union if union > 0 else 0.0
+def _token_set(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
 
 
-def temporal_metrics(
-    targets: list[tuple[float, float]],
-    predictions: list[tuple[float, float] | None],
-    labels: list[str] | None = None,
+def lexical_overlap(reference: str, prediction: str) -> float:
+    reference_tokens = _token_set(reference)
+    prediction_tokens = _token_set(prediction)
+    if not reference_tokens and not prediction_tokens:
+        return 1.0
+    if not reference_tokens or not prediction_tokens:
+        return 0.0
+    return len(reference_tokens & prediction_tokens) / len(reference_tokens | prediction_tokens)
+
+
+def module_c_metrics(
+    targets: list[bool],
+    predictions: list[bool | None],
+    *,
+    target_reasonings: list[str] | None = None,
+    predicted_reasonings: list[str | None] | None = None,
 ) -> dict[str, float]:
-    labels = labels or ["LOCALIZE"] * len(targets)
-    positives = [
-        (target, pred)
-        for target, pred, label in zip(targets, predictions, labels)
-        if label != "NO_ACTION"
-    ]
-    negatives = [
-        pred
-        for pred, label in zip(predictions, labels)
-        if label == "NO_ACTION"
-    ]
-    valid = [(target, pred) for target, pred in positives if pred is not None]
-    invalid_count = len(positives) - len(valid)
-    ious = [temporal_iou(pred, target) for target, pred in valid]
-    metrics: dict[str, float] = {
-        "eval_temporal/num_samples": float(len(targets)),
-        "eval_temporal/num_positive_samples": float(len(positives)),
-        "eval_temporal/num_no_action_samples": float(len(negatives)),
-        "eval_temporal/invalid_rate": invalid_count / len(positives) if positives else 0.0,
-        "eval_temporal/mean_iou": sum(ious) / len(ious) if ious else 0.0,
+    tp = fp = tn = fn = invalid = 0
+    for target, prediction in zip(targets, predictions):
+        if prediction is None:
+            invalid += 1
+            if target:
+                fn += 1
+            else:
+                fp += 1
+        elif target and prediction:
+            tp += 1
+        elif not target and prediction:
+            fp += 1
+        elif not target and not prediction:
+            tn += 1
+        else:
+            fn += 1
+
+    total = tp + fp + tn + fn
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    specificity = tn / (tn + fp) if tn + fp else 0.0
+    accuracy = (tp + tn) / total if total else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    denominator = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    mcc = ((tp * tn) - (fp * fn)) / denominator if denominator else 0.0
+    metrics = {
+        "eval_mistake/accuracy": accuracy,
+        "eval_mistake/precision": precision,
+        "eval_mistake/recall": recall,
+        "eval_mistake/f1": f1,
+        "eval_mistake/specificity": specificity,
+        "eval_mistake/balanced_accuracy": (recall + specificity) / 2.0,
+        "eval_mistake/mcc": mcc,
+        "eval_mistake/false_positive_rate": fp / (fp + tn) if fp + tn else 0.0,
+        "eval_mistake/false_negative_rate": fn / (fn + tp) if fn + tp else 0.0,
+        "eval_mistake/invalid_json_rate": invalid / total if total else 0.0,
+        "eval_mistake/tp": float(tp),
+        "eval_mistake/fp": float(fp),
+        "eval_mistake/tn": float(tn),
+        "eval_mistake/fn": float(fn),
+        "eval_mistake/num_samples": float(total),
     }
-    if negatives:
-        no_action_correct = sum(1 for pred in negatives if pred is None)
-        metrics["eval_temporal/no_action_accuracy"] = no_action_correct / len(negatives)
-        metrics["eval_temporal/no_action_false_positive_rate"] = 1.0 - metrics["eval_temporal/no_action_accuracy"]
-    else:
-        metrics["eval_temporal/no_action_accuracy"] = 0.0
-        metrics["eval_temporal/no_action_false_positive_rate"] = 0.0
-    for threshold in (0.1, 0.3, 0.5):
-        hits = sum(1 for value in ious if value >= threshold)
-        metrics[f"eval_temporal/recall_at_{threshold:.1f}"] = hits / len(positives) if positives else 0.0
-        metrics[f"eval_temporal/f1_at_{threshold:.1f}"] = (
-            2 * hits / (len(valid) + len(positives)) if valid or positives else 0.0
+    if target_reasonings is not None and predicted_reasonings is not None:
+        valid_reasonings = [
+            (target, prediction)
+            for target, prediction in zip(target_reasonings, predicted_reasonings)
+            if prediction is not None and prediction.strip()
+        ]
+        metrics["eval_reasoning/nonempty_rate"] = len(valid_reasonings) / total if total else 0.0
+        metrics["eval_reasoning/lexical_overlap"] = (
+            sum(lexical_overlap(target, prediction) for target, prediction in valid_reasonings) / len(valid_reasonings)
+            if valid_reasonings else 0.0
         )
-    if valid:
-        start_errors = [abs(pred[0] - target[0]) for target, pred in valid]
-        end_errors = [abs(pred[1] - target[1]) for target, pred in valid]
-        center_errors = [abs(((pred[0] + pred[1]) / 2) - ((target[0] + target[1]) / 2)) for target, pred in valid]
-        duration_errors = [abs((pred[1] - pred[0]) - (target[1] - target[0])) for target, pred in valid]
-        metrics.update({
-            "eval_temporal/start_mae": sum(start_errors) / len(start_errors),
-            "eval_temporal/end_mae": sum(end_errors) / len(end_errors),
-            "eval_temporal/center_mae": sum(center_errors) / len(center_errors),
-            "eval_temporal/duration_mae": sum(duration_errors) / len(duration_errors),
-        })
-        for tolerance in (0.5, 1.0, 2.0):
-            within = sum(
-                1 for start_error, end_error in zip(start_errors, end_errors)
-                if start_error <= tolerance and end_error <= tolerance
-            )
-            metrics[f"eval_temporal/boundary_within_{tolerance:.1f}s"] = within / len(positives)
-    else:
-        metrics.update({
-            "eval_temporal/start_mae": 0.0,
-            "eval_temporal/end_mae": 0.0,
-            "eval_temporal/center_mae": 0.0,
-            "eval_temporal/duration_mae": 0.0,
-            "eval_temporal/boundary_within_0.5s": 0.0,
-            "eval_temporal/boundary_within_1.0s": 0.0,
-            "eval_temporal/boundary_within_2.0s": 0.0,
-        })
     return metrics
 
 
-class ModuleBTemporalMetricsCallback:
+class ModuleCMistakeMetricsCallback:
     def __init__(
         self,
         *,
@@ -478,9 +499,11 @@ class ModuleBTemporalMetricsCallback:
             return control
         model = kwargs["model"]
         was_training = model.training
-        predictions: list[tuple[float, float] | None] = []
-        targets: list[tuple[float, float]] = []
-        labels: list[str] = []
+        predictions: list[bool | None] = []
+        targets: list[bool] = []
+        predicted_reasonings: list[str | None] = []
+        target_reasonings: list[str] = []
+
         import torch
         from unsloth import FastVisionModel
 
@@ -488,23 +511,24 @@ class ModuleBTemporalMetricsCallback:
         try:
             with torch.inference_mode():
                 for example in self.eval_examples:
-                    generated_text = self._generate_span(model, example)
-                    parsed = parse_temporal_prediction(generated_text)
-                    if parsed is not None:
-                        parsed = (
-                            example["window_start"] + parsed[0],
-                            example["window_start"] + parsed[1],
-                        )
-                    predictions.append(parsed)
-                    targets.append((float(example["gt_start"]), float(example["gt_end"])))
-                    labels.append(str(example.get("label", "LOCALIZE")))
+                    generated_text = self._generate_json(model, example)
+                    parsed = parse_module_c_prediction(generated_text)
+                    predictions.append(None if parsed is None else bool(parsed["mistake"]))
+                    predicted_reasonings.append(None if parsed is None else str(parsed["reasoning"]))
+                    targets.append(bool(example.get("mistake")))
+                    target_reasonings.append(str(example.get("reasoning") or ""))
         finally:
             if was_training:
                 FastVisionModel.for_training(model)
             disable_unsloth_extra_outputs()
             release_cuda_memory()
 
-        metrics = temporal_metrics(targets, predictions, labels)
+        metrics = module_c_metrics(
+            targets,
+            predictions,
+            target_reasonings=target_reasonings,
+            predicted_reasonings=predicted_reasonings,
+        )
         callback_metrics = kwargs.get("metrics")
         if isinstance(callback_metrics, dict):
             callback_metrics.update(metrics)
@@ -513,7 +537,7 @@ class ModuleBTemporalMetricsCallback:
 
     def _generation_inputs(self, example: dict[str, Any]) -> dict[str, Any]:
         messages = [
-            dict(message)
+            copy.deepcopy(message)
             for message in example["messages"]
             if message.get("role") != "assistant"
         ]
@@ -539,7 +563,7 @@ class ModuleBTemporalMetricsCallback:
                 proc_kwargs["video_metadata"] = video_metadata
         return self.data_collator._base.processor(**proc_kwargs)
 
-    def _generate_span(self, model: Any, example: dict[str, Any]) -> str:
+    def _generate_json(self, model: Any, example: dict[str, Any]) -> str:
         inputs = self._generation_inputs(example)
         device = next(model.parameters()).device
         inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
@@ -561,7 +585,7 @@ class ModuleBTemporalMetricsCallback:
             release_cuda_memory()
 
 
-class ModuleBUnslothEnvGuardCallback:
+class ModuleCUnslothEnvGuardCallback:
     def __init__(self) -> None:
         from transformers import TrainerCallback
 
@@ -643,14 +667,14 @@ def build_trainer(
         response_part="<|im_start|>assistant\n",
         completion_only_loss=True,
     )
-    temporal_callback = ModuleBTemporalMetricsCallback(
+    mistake_callback = ModuleCMistakeMetricsCallback(
         eval_examples=eval_dataset,
         data_collator=data_collator,
         tokenizer=tokenizer,
         max_samples=args.eval_generation_max_samples,
         max_new_tokens=args.eval_generation_max_new_tokens,
     )
-    callbacks.append(temporal_callback)
+    callbacks.append(mistake_callback)
     checkpoint_callback = EpochCheckpointCallback(
         output_dir=args.output_dir,
         eval_epochs=args.eval_epochs,
@@ -669,7 +693,7 @@ def build_trainer(
         ),
     )
     callbacks.append(checkpoint_callback)
-    callbacks.append(ModuleBUnslothEnvGuardCallback())
+    callbacks.append(ModuleCUnslothEnvGuardCallback())
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -679,31 +703,31 @@ def build_trainer(
         args=SFTConfig(**trainer_args),
         callbacks=callbacks,
     )
-    temporal_callback.trainer = trainer
+    mistake_callback.trainer = trainer
     checkpoint_callback.trainer = trainer
     return trainer
 
 
 def print_dry_run(
-    dataset: EgoOopsModuleBDataset,
+    dataset: EgoOopsModuleCDataset,
     train_conversations: list[dict[str, Any]],
     val_conversations: list[dict[str, Any]],
     split: dict[str, Any],
     split_path: Path,
     limit: int,
 ) -> None:
-    print("Module B full dataset summary:")
+    print("Module C full dataset summary:")
     print(json.dumps(summarize_dataset(dataset), indent=2, ensure_ascii=False))
-    print(f"Module B split file: {split_path}")
-    print("Module B split video summary:")
+    print(f"Module C split file: {split_path}")
+    print("Module C split video summary:")
     print(json.dumps({
         "train_video_ids": split["train_video_ids"],
         "val_video_ids": split["val_video_ids"],
         "tasks": split["tasks"],
     }, indent=2, ensure_ascii=False))
-    print("Module B train summary:")
+    print("Module C train summary:")
     print(json.dumps(summarize_conversations(train_conversations), indent=2, ensure_ascii=False))
-    print("Module B validation summary:")
+    print("Module C validation summary:")
     print(json.dumps(summarize_conversations(val_conversations), indent=2, ensure_ascii=False))
     for index, conversation in enumerate(train_conversations[: max(0, limit)]):
         print(f"\nExample {index}:")
@@ -713,11 +737,11 @@ def print_dry_run(
 def main() -> None:
     args = parse_args()
     print(
-        "Module B Unsloth env: "
+        "Module C Unsloth env: "
         f"UNSLOTH_RETURN_LOGITS={os.environ.get('UNSLOTH_RETURN_LOGITS')}, "
         f"UNSLOTH_RETURN_HIDDEN_STATES={os.environ.get('UNSLOTH_RETURN_HIDDEN_STATES')}"
     )
-    dataset = build_module_b_dataset(args)
+    dataset = build_module_c_dataset(args)
     split, split_path = load_or_create_video_split(dataset, args)
     train_conversations = conversations_for_video_ids(
         dataset,
@@ -733,31 +757,27 @@ def main() -> None:
         min_frames=args.min_frames,
         max_frames=args.eval_max_frames,
     )
-    conversations = train_conversations + val_conversations
-    if not conversations:
-        raise SystemExit("Module B dataset produced no conversations.")
     if not train_conversations or not val_conversations:
         raise ValueError("Train/validation split produced an empty conversation split.")
     if args.dry_run:
         print_dry_run(dataset, train_conversations, val_conversations, split, split_path, args.print_examples)
         return
+    print("Module C full dataset summary:")
+    print(json.dumps(summarize_dataset(dataset), indent=2, ensure_ascii=False))
+    print(f"Module C split file: {split_path}")
+    print("Module C train summary:")
+    print(json.dumps(summarize_conversations(train_conversations), indent=2, ensure_ascii=False))
+    print("Module C validation summary:")
+    print(json.dumps(summarize_conversations(val_conversations), indent=2, ensure_ascii=False))
+
     save_run_config(
         args=args,
         dataset=dataset,
-        conversations=conversations,
         train_conversations=train_conversations,
         val_conversations=val_conversations,
         split=split,
         split_path=split_path,
     )
-    print("Module B full dataset summary:")
-    print(json.dumps(summarize_dataset(dataset), indent=2, ensure_ascii=False))
-    print(f"Module B split file: {split_path}")
-    print("Module B train summary:")
-    print(json.dumps(summarize_conversations(train_conversations), indent=2, ensure_ascii=False))
-    print("Module B validation summary:")
-    print(json.dumps(summarize_conversations(val_conversations), indent=2, ensure_ascii=False))
-
     model, tokenizer = load_unsloth_model(args)
     trainer = build_trainer(
         model=model,

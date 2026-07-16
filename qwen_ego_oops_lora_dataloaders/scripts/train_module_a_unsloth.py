@@ -178,6 +178,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-r", type=int, default=8)
     parser.add_argument("--lora-alpha", type=int, default=16)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--lora-target-modules",
+        choices=("auto", "all-linear"),
+        default="auto",
+        help=(
+            "LoRA target selection. 'auto' lets Unsloth derive targets from the finetune_* flags. "
+            "'all-linear' explicitly targets all linear layers and therefore requires all finetune_* "
+            "flags to be true."
+        ),
+    )
     parser.add_argument("--finetune-vision-layers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--finetune-language-layers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--finetune-attention-modules", action=argparse.BooleanOptionalAction, default=True)
@@ -329,6 +339,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--positive-loss-weight must be positive.")
     if args.fbeta_beta <= 0:
         parser.error("--fbeta-beta must be positive.")
+    validate_lora_target_configuration(args, parser.error)
     if args.greater_is_better is None:
         args.greater_is_better = not args.metric_for_best_model.endswith("loss")
     return args
@@ -361,6 +372,36 @@ def summarize_trainable_parameters(model: Any) -> dict[str, int]:
         else:
             summary["other"] += count
     return summary
+
+
+def validate_lora_target_configuration(args: argparse.Namespace, error: Any) -> None:
+    if not any((
+        args.finetune_vision_layers,
+        args.finetune_language_layers,
+        args.finetune_attention_modules,
+        args.finetune_mlp_modules,
+    )):
+        error("At least one finetune_* LoRA target flag must be true.")
+
+    if args.lora_target_modules == "all-linear" and not all((
+        args.finetune_vision_layers,
+        args.finetune_language_layers,
+        args.finetune_attention_modules,
+        args.finetune_mlp_modules,
+    )):
+        error(
+            "--lora-target-modules=all-linear conflicts with disabled finetune_* flags. "
+            "Use --lora-target-modules=auto to respect the flags, or enable all finetune_* flags."
+        )
+
+
+def resolve_lora_target_modules(args: argparse.Namespace) -> str | None:
+    target_modules = getattr(args, "lora_target_modules", "auto")
+    if target_modules == "auto":
+        return None
+    if target_modules == "all-linear":
+        return "all-linear"
+    raise ValueError(f"Unsupported lora_target_modules: {target_modules}")
 
 
 def build_module_a_dataset(args: argparse.Namespace) -> EgoOopsModuleADataset:
@@ -814,7 +855,7 @@ def load_unsloth_model(args: argparse.Namespace) -> tuple[Any, Any]:
         random_state=args.seed,
         use_rslora=False,
         loftq_config=None,
-        target_modules="all-linear",
+        target_modules=resolve_lora_target_modules(args),
         ensure_weight_tying=True,
     )
     try:
@@ -827,6 +868,11 @@ def load_unsloth_model(args: argparse.Namespace) -> tuple[Any, Any]:
     trainable = summarize_trainable_parameters(model)
     print("Trainable parameter summary:")
     print(json.dumps(trainable, indent=2, sort_keys=True))
+    if not args.finetune_vision_layers and trainable["visual"] != 0:
+        raise RuntimeError(
+            "finetune_vision_layers=False, but visual LoRA parameters are trainable. "
+            "Check --lora-target-modules for conflicting target selection."
+        )
     if args.finetune_vision_layers and trainable["visual"] == 0:
         raise RuntimeError(
             "finetune_vision_layers=True, but no trainable visual parameters were found."

@@ -19,8 +19,8 @@ load_env_defaults() {
 if [[ -f "${REPO_DIR}/.env" ]]; then
   load_env_defaults "${REPO_DIR}/.env"
 fi
-if [[ -f "${REPO_DIR}/.env.module_b" ]]; then
-  load_env_defaults "${REPO_DIR}/.env.module_b"
+if [[ -f "${REPO_DIR}/.env.module_c" ]]; then
+  load_env_defaults "${REPO_DIR}/.env.module_c"
 fi
 
 if [[ -n "${VAST_API_KEY:-}" ]]; then
@@ -30,9 +30,9 @@ if [[ -n "${VAST_API_KEY:-}" ]]; then
 fi
 
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-RUN_NAME="${RUN_NAME:-module_b_vastai_${RUN_TIMESTAMP}}"
+RUN_NAME="${RUN_NAME:-module_c_vastai_${RUN_TIMESTAMP}}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_DIR}/outputs}"
-OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/module_b_qwen35_lora_grounding/runs/${RUN_NAME}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/module_c_qwen35_lora_reasoning/runs/${RUN_NAME}}"
 EGO_OOPS_ROOT="${EGO_OOPS_ROOT:-${REPO_DIR}/ego_oops}"
 DATA_ROOT="${DATA_ROOT:-${REPO_DIR}/data/videos-processed-720p}"
 COPY_VIDEOS_TO_SHM="${COPY_VIDEOS_TO_SHM:-false}"
@@ -41,15 +41,15 @@ MAX_VIDEOS="${MAX_VIDEOS:-50}"
 MODEL_NAME="${MODEL_NAME:-unsloth/Qwen3.5-2B}"
 LOAD_IN_4BIT="${LOAD_IN_4BIT:-false}"
 LOAD_IN_16BIT="${LOAD_IN_16BIT:-true}"
-LORA_R="${LORA_R:-16}"
-LORA_ALPHA="${LORA_ALPHA:-16}"
+LORA_R="${LORA_R:-32}"
+LORA_ALPHA="${LORA_ALPHA:-64}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
 LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-auto}"
 TRAIN_MODE="${TRAIN_MODE:-steps}"
 MAX_STEPS="${MAX_STEPS:-100}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-3.0}"
-CHECKPOINT_EPOCHS="${CHECKPOINT_EPOCHS:-2}"
-EVAL_EPOCHS="${EVAL_EPOCHS:-2}"
+CHECKPOINT_EPOCHS="${CHECKPOINT_EPOCHS:-1}"
+EVAL_EPOCHS="${EVAL_EPOCHS:-1}"
 KEEP_LAST_CHECKPOINTS="${KEEP_LAST_CHECKPOINTS:-4}"
 KEEP_BEST_CHECKPOINTS="${KEEP_BEST_CHECKPOINTS:-4}"
 VAL_FRACTION="${VAL_FRACTION:-0.2}"
@@ -58,20 +58,21 @@ SPLIT_FILE="${SPLIT_FILE:-}"
 REGENERATE_SPLIT="${REGENERATE_SPLIT:-false}"
 EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-3}"
 EARLY_STOPPING_THRESHOLD="${EARLY_STOPPING_THRESHOLD:-0.0}"
-METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-eval_temporal/mean_iou}"
+METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-eval_mistake/f1}"
 GREATER_IS_BETTER="${GREATER_IS_BETTER:-true}"
 WANDB_PROJECT="${WANDB_PROJECT:-qwen-omd}"
-WANDB_ARTIFACT_PREFIX="${WANDB_ARTIFACT_PREFIX:-module-b}"
-INCLUDE_INCOMPLETE_NEGATIVES="${INCLUDE_INCOMPLETE_NEGATIVES:-false}"
-MODULE_B_NEGATIVE_RATIO="${MODULE_B_NEGATIVE_RATIO:-0.25}"
+WANDB_ARTIFACT_PREFIX="${WANDB_ARTIFACT_PREFIX:-module-c}"
+MODULE_C_MIN_DURATION_SECONDS="${MODULE_C_MIN_DURATION_SECONDS:-0.5}"
+MODULE_C_JITTER_RATIO_MIN="${MODULE_C_JITTER_RATIO_MIN:-0.05}"
+MODULE_C_JITTER_RATIO_MAX="${MODULE_C_JITTER_RATIO_MAX:-0.10}"
 EVAL_GENERATION_MAX_SAMPLES="${EVAL_GENERATION_MAX_SAMPLES:--1}"
-EVAL_GENERATION_MAX_NEW_TOKENS="${EVAL_GENERATION_MAX_NEW_TOKENS:-64}"
+EVAL_GENERATION_MAX_NEW_TOKENS="${EVAL_GENERATION_MAX_NEW_TOKENS:-128}"
 FPS="${FPS:-1.0}"
 MIN_FRAMES="${MIN_FRAMES:-2}"
 MAX_FRAMES="${MAX_FRAMES:-32}"
 EVAL_MAX_FRAMES="${EVAL_MAX_FRAMES:-${MAX_FRAMES}}"
 VISION_RESIZE="${VISION_RESIZE:-512}"
-MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-6144}"
+MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-8192}"
 FINETUNE_VISION_LAYERS="${FINETUNE_VISION_LAYERS:-false}"
 FINETUNE_LANGUAGE_LAYERS="${FINETUNE_LANGUAGE_LAYERS:-true}"
 FINETUNE_ATTENTION_MODULES="${FINETUNE_ATTENTION_MODULES:-true}"
@@ -154,7 +155,7 @@ import wandb
 
 def sanitize(name: str) -> str:
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
-    return ("".join(char if char in allowed else "-" for char in name).strip(".-") or "module-b-all-checkpoints")
+    return ("".join(char if char in allowed else "-" for char in name).strip(".-") or "module-c-all-checkpoints")
 
 output_dir = Path(os.environ["OUTPUT_DIR"])
 run = wandb.init(
@@ -209,7 +210,7 @@ trap cleanup EXIT
 cd "${PROJECT_DIR}"
 
 TRAIN_ARGS=(
-  python scripts/train_module_b_unsloth.py
+  python scripts/train_module_c_unsloth.py
   --model-name "${MODEL_NAME}"
   --lora-r "${LORA_R}"
   --lora-alpha "${LORA_ALPHA}"
@@ -229,7 +230,9 @@ TRAIN_ARGS=(
   --early-stopping-threshold "${EARLY_STOPPING_THRESHOLD}"
   --metric-for-best-model "${METRIC_FOR_BEST_MODEL}"
   --wandb-artifact-prefix "${WANDB_ARTIFACT_PREFIX}"
-  --module-b-negative-ratio "${MODULE_B_NEGATIVE_RATIO}"
+  --module-c-min-duration-seconds "${MODULE_C_MIN_DURATION_SECONDS}"
+  --module-c-jitter-ratio-min "${MODULE_C_JITTER_RATIO_MIN}"
+  --module-c-jitter-ratio-max "${MODULE_C_JITTER_RATIO_MAX}"
   --eval-generation-max-samples "${EVAL_GENERATION_MAX_SAMPLES}"
   --eval-generation-max-new-tokens "${EVAL_GENERATION_MAX_NEW_TOKENS}"
   --fps "${FPS}"
@@ -257,11 +260,6 @@ case "${WANDB_LOG_BEST_CHECKPOINTS}" in
   1|true|TRUE|yes|YES) TRAIN_ARGS+=(--wandb-log-best-checkpoints) ;;
   0|false|FALSE|no|NO) TRAIN_ARGS+=(--no-wandb-log-best-checkpoints) ;;
   *) echo "WANDB_LOG_BEST_CHECKPOINTS must be true or false, got: ${WANDB_LOG_BEST_CHECKPOINTS}" >&2; exit 1 ;;
-esac
-case "${INCLUDE_INCOMPLETE_NEGATIVES}" in
-  1|true|TRUE|yes|YES) TRAIN_ARGS+=(--include-incomplete-negatives) ;;
-  0|false|FALSE|no|NO) TRAIN_ARGS+=(--no-include-incomplete-negatives) ;;
-  *) echo "INCLUDE_INCOMPLETE_NEGATIVES must be true or false, got: ${INCLUDE_INCOMPLETE_NEGATIVES}" >&2; exit 1 ;;
 esac
 case "${DRY_RUN}" in
   1|true|TRUE|yes|YES) TRAIN_ARGS+=(--dry-run --print-examples "${PRINT_EXAMPLES}") ;;

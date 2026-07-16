@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Online Mistake Detection Pipeline</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Local 16GB Pipeline Demo</p>
+          <h1>Module A -> Module B -> Module C</h1>
+          <p>Select a video, choose a 5-second-snapped clip, and run genuine model predictions one module at a time.</p>
+        </div>
+        <button id="unloadModelButton" class="secondary">Unload GPU Model</button>
+      </header>
+
+      <section class="panel controls">
+        <label>
+          Video
+          <select id="videoSelect"></select>
+        </label>
+        <label>
+          Step / Instruction
+          <select id="stepSelect"></select>
+        </label>
+      </section>
+
+      <section class="grid">
+        <div class="panel video-panel">
+          <video id="videoPlayer" controls preload="metadata"></video>
+          <div class="timeline">
+            <div id="selectedRange" class="selected-range"></div>
+            <div id="moduleBRange" class="module-b-range hidden"></div>
+          </div>
+          <div class="range-row">
+            <label>
+              Start
+              <input id="startRange" type="range" min="0" max="0" step="5" value="0" />
+              <span id="startLabel">0.00s</span>
+            </label>
+            <label>
+              End
+              <input id="endRange" type="range" min="5" max="5" step="5" value="5" />
+              <span id="endLabel">5.00s</span>
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="playClipButton">Play Selected Clip</button>
+            <button id="runAButton">Run Module A</button>
+            <button id="runBButton">Run Module B</button>
+            <button id="runCButton">Run Module C</button>
+          </div>
+          <p id="status" class="status">Loading videos...</p>
+        </div>
+
+        <aside class="panel details">
+          <h2>Video Metadata</h2>
+          <pre id="videoMetadata">{}</pre>
+        </aside>
+      </section>
+
+      <section class="results">
+        <article class="panel result-card">
+          <h2>Module A</h2>
+          <div id="moduleAParsed" class="parsed">Not run</div>
+          <pre id="moduleARaw"></pre>
+        </article>
+        <article class="panel result-card">
+          <h2>Module B</h2>
+          <div id="moduleBParsed" class="parsed">Not run</div>
+          <pre id="moduleBRaw"></pre>
+        </article>
+        <article class="panel result-card">
+          <h2>Module C</h2>
+          <div id="moduleCParsed" class="parsed">Not run</div>
+          <pre id="moduleCRaw"></pre>
+        </article>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

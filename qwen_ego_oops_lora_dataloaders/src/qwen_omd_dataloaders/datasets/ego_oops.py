@@ -137,7 +137,17 @@ def _module_b_prompt(instruction: str) -> str:
 
 
 def _module_c_prompt(instruction: str) -> str:
-    return f"Instruction: {instruction}\nAnalyze the execution."
+    return (
+        f"Instruction: {instruction}\n"
+        "Watch the bounded video clip and decide whether the visible execution contains an EgoOops-style "
+        "mistake relative to the written instruction.\n"
+        "A mistake includes using the wrong object, tool, color, material, or part; using an object in the "
+        "wrong way; accidental or unintended actions; self-correction after an error; wrong timing, portion, "
+        "or order inside the step; or any other visible deviation from the instruction.\n"
+        "Do not mark ordinary execution variation as a mistake: brief pauses, repeated grasping, small hand "
+        "adjustments, or repositioning are acceptable when the person is still following the instruction.\n"
+        "Return JSON only with keys mistake and reasoning."
+    )
 
 
 def _procedural_segments(record: VideoRecord) -> list[Segment]:
@@ -437,13 +447,15 @@ class EgoOopsModuleCDataset(Dataset):
             if video_duration <= 0:
                 video_duration = max((segment.end for segment in record.segments), default=0.0)
             for segment in record.segments:
-                if segment.duration < 0.5:
+                if segment.duration < self.config.min_duration_seconds:
                     continue
                 jitter = rng.uniform(self.config.jitter_ratio_min, self.config.jitter_ratio_max) * segment.duration
                 start = max(0.0, segment.start + rng.uniform(-jitter, jitter))
                 end = min(video_duration, segment.end + rng.uniform(-jitter, jitter))
-                if end - start < 0.5:
+                if end - start < self.config.min_duration_seconds:
                     start, end = segment.start, segment.end
+                if end - start < self.config.min_duration_seconds:
+                    continue
                 reasoning = _reasoning_for_segment(segment)
                 target = json.dumps(
                     {"mistake": segment.is_mistake, "reasoning": reasoning},
@@ -466,7 +478,18 @@ class EgoOopsModuleCDataset(Dataset):
                     label="MISTAKE" if segment.is_mistake else "CORRECT",
                     mistake=segment.is_mistake,
                     reasoning=reasoning,
-                    metadata={"instruction": segment.instruction, "error_label": segment.error_label},
+                    metadata={
+                        "instruction": segment.instruction,
+                        "error_label": segment.error_label,
+                        "mistake_labels": _split_error_labels(segment.error_label),
+                        "raw_labels": list(segment.raw.get("labels", [])),
+                        "caption": segment.caption,
+                        "is_undefined_instruction": segment.instruction_index == -1,
+                        "clip_relative_gt_start": segment.start - start,
+                        "clip_relative_gt_end": segment.end - start,
+                        "original_gt_start": segment.start,
+                        "original_gt_end": segment.end,
+                    },
                 ))
         return examples
 
@@ -480,10 +503,16 @@ def _instruction_lookup(records: list[VideoRecord]) -> dict[tuple[str, int], str
 
 
 def _reasoning_for_segment(segment: Segment) -> str:
-    if segment.caption:
-        return segment.caption
     if segment.is_mistake:
+        if segment.caption:
+            return segment.caption
         if segment.error_label:
-            return f"The segment is labeled as {segment.error_label}."
+            return f"The execution deviates from the instruction and is labeled as {segment.error_label}."
         return "The segment is labeled as an undefined or extra mistake action."
-    return "The action follows the expected instruction."
+    return "The observed action follows the instructed step without a visible procedural deviation."
+
+
+def _split_error_labels(error_label: str | None) -> list[str]:
+    if not error_label:
+        return []
+    return [item.strip() for item in error_label.split(",") if item.strip()]

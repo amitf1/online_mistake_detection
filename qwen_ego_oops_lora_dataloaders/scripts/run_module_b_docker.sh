@@ -44,6 +44,7 @@ LOAD_IN_16BIT="${LOAD_IN_16BIT:-true}"
 LORA_R="${LORA_R:-16}"
 LORA_ALPHA="${LORA_ALPHA:-16}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
+LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-auto}"
 TRAIN_MODE="${TRAIN_MODE:-steps}"
 MAX_STEPS="${MAX_STEPS:-100}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-3.0}"
@@ -68,9 +69,13 @@ EVAL_GENERATION_MAX_NEW_TOKENS="${EVAL_GENERATION_MAX_NEW_TOKENS:-64}"
 FPS="${FPS:-1.0}"
 MIN_FRAMES="${MIN_FRAMES:-2}"
 MAX_FRAMES="${MAX_FRAMES:-32}"
+EVAL_MAX_FRAMES="${EVAL_MAX_FRAMES:-${MAX_FRAMES}}"
 VISION_RESIZE="${VISION_RESIZE:-512}"
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-6144}"
 FINETUNE_VISION_LAYERS="${FINETUNE_VISION_LAYERS:-false}"
+FINETUNE_LANGUAGE_LAYERS="${FINETUNE_LANGUAGE_LAYERS:-true}"
+FINETUNE_ATTENTION_MODULES="${FINETUNE_ATTENTION_MODULES:-true}"
+FINETUNE_MLP_MODULES="${FINETUNE_MLP_MODULES:-true}"
 VIDEO_READER="${VIDEO_READER:-decord}"
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 RUN_NAME="${RUN_NAME:-module_b_qwen35_lora_grounding_${RUN_TIMESTAMP}}"
@@ -103,6 +108,7 @@ TRAIN_ARGS=(
   --lora-r "${LORA_R}"
   --lora-alpha "${LORA_ALPHA}"
   --lora-dropout "${LORA_DROPOUT}"
+  --lora-target-modules "${LORA_TARGET_MODULES}"
   --max-videos "${MAX_VIDEOS}"
   --train-mode "${TRAIN_MODE}"
   --max-steps "${MAX_STEPS}"
@@ -123,6 +129,7 @@ TRAIN_ARGS=(
   --fps "${FPS}"
   --min-frames "${MIN_FRAMES}"
   --max-frames "${MAX_FRAMES}"
+  --eval-max-frames "${EVAL_MAX_FRAMES}"
   --vision-resize "${VISION_RESIZE}"
   --max-seq-length "${MAX_SEQ_LENGTH}"
   --video-root "${DATA_ROOT}"
@@ -176,6 +183,21 @@ case "${FINETUNE_VISION_LAYERS}" in
   1|true|TRUE|yes|YES) TRAIN_ARGS+=(--finetune-vision-layers) ;;
   0|false|FALSE|no|NO) TRAIN_ARGS+=(--no-finetune-vision-layers) ;;
   *) echo "FINETUNE_VISION_LAYERS must be true or false, got: ${FINETUNE_VISION_LAYERS}" >&2; exit 1 ;;
+esac
+case "${FINETUNE_LANGUAGE_LAYERS}" in
+  1|true|TRUE|yes|YES) TRAIN_ARGS+=(--finetune-language-layers) ;;
+  0|false|FALSE|no|NO) TRAIN_ARGS+=(--no-finetune-language-layers) ;;
+  *) echo "FINETUNE_LANGUAGE_LAYERS must be true or false, got: ${FINETUNE_LANGUAGE_LAYERS}" >&2; exit 1 ;;
+esac
+case "${FINETUNE_ATTENTION_MODULES}" in
+  1|true|TRUE|yes|YES) TRAIN_ARGS+=(--finetune-attention-modules) ;;
+  0|false|FALSE|no|NO) TRAIN_ARGS+=(--no-finetune-attention-modules) ;;
+  *) echo "FINETUNE_ATTENTION_MODULES must be true or false, got: ${FINETUNE_ATTENTION_MODULES}" >&2; exit 1 ;;
+esac
+case "${FINETUNE_MLP_MODULES}" in
+  1|true|TRUE|yes|YES) TRAIN_ARGS+=(--finetune-mlp-modules) ;;
+  0|false|FALSE|no|NO) TRAIN_ARGS+=(--no-finetune-mlp-modules) ;;
+  *) echo "FINETUNE_MLP_MODULES must be true or false, got: ${FINETUNE_MLP_MODULES}" >&2; exit 1 ;;
 esac
 
 docker run --rm "${DOCKER_TTY_ARGS[@]}" \

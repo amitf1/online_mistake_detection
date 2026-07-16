@@ -36,3 +36,5 @@ opencv-python
 numpy
 tensorboard
 wandb
+fastapi
+uvicorn
