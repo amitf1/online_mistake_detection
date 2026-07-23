@@ -74,6 +74,7 @@ MIN_FRAMES="${MIN_FRAMES:-2}"
 MAX_FRAMES="${MAX_FRAMES:-32}"
 VISION_RESIZE="${VISION_RESIZE:-512}"
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-6144}"
+MODULE_A_LABEL_MODE="${MODULE_A_LABEL_MODE:-step_id}"
 FINETUNE_VISION_LAYERS="${FINETUNE_VISION_LAYERS:-false}"
 FINETUNE_LANGUAGE_LAYERS="${FINETUNE_LANGUAGE_LAYERS:-true}"
 FINETUNE_ATTENTION_MODULES="${FINETUNE_ATTENTION_MODULES:-true}"
@@ -98,6 +99,7 @@ export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-}"
 export WANDB_DIR="${WANDB_DIR:-${OUTPUT_ROOT}/wandb}"
 export HF_HOME="${HF_HOME:-/cache/huggingface}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
+export MODULE_A_LABEL_MODE
 export FORCE_UNSLOTH_VIDEO_READER="${VIDEO_READER:-decord}"
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 
@@ -225,6 +227,7 @@ cd "${PROJECT_DIR}"
 TRAIN_ARGS=(
   python scripts/train_module_a_unsloth.py
   --model-name "${MODEL_NAME}"
+  --module-a-label-mode "${MODULE_A_LABEL_MODE}"
   --lora-r "${LORA_R}"
   --lora-alpha "${LORA_ALPHA}"
   --lora-dropout "${LORA_DROPOUT}"

@@ -56,7 +56,7 @@ def build_record() -> VideoRecord:
                 start=7.0,
                 end=8.0,
                 instruction_index=-1,
-                instruction="undefined / extra mistake action",
+                instruction="undefined / extra step",
                 is_mistake=True,
                 error_label="others",
                 caption="",

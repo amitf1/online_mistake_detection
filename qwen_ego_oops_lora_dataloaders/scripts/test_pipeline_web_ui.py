@@ -47,9 +47,20 @@ def test_static_files_reference_expected_controls() -> None:
     assert ".module-b-range" in css
 
 
+def test_manual_window_label_is_not_hardcoded_wait() -> None:
+    source = SERVER.read_text(encoding="utf-8")
+    assert 'target_text="WAIT"' not in source
+    assert "module_a_label_mode" in source
+    assert "_module_a_step_id_prompt" in source
+    assert "next_clip_start" in source
+    assert "label=label" in source
+    assert "EXTRA_STEP_INSTRUCTION" in source
+
+
 def main() -> None:
     test_server_source_has_required_routes()
     test_static_files_reference_expected_controls()
+    test_manual_window_label_is_not_hardcoded_wait()
     print("Pipeline web UI tests passed.")
 
 

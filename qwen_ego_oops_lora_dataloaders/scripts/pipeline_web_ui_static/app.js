@@ -33,6 +33,10 @@ function seconds(value) {
   return `${Number(value).toFixed(2)}s`;
 }
 
+function timingText(payload) {
+  return `Prediction time: ${seconds(payload.prediction_seconds || 0)}\nRequest wall time: ${seconds(payload.request_wall_seconds || 0)}`;
+}
+
 function selectedClip() {
   return {
     video_id: elements.videoSelect.value,
@@ -175,7 +179,7 @@ function stopAtClipEnd() {
 
 async function runModuleA() {
   await runModule("/api/module-a", selectedClip(), elements.moduleAParsed, elements.moduleARaw, (payload) => {
-    return `Prediction: ${payload.prediction}`;
+    return `Prediction: ${payload.prediction}\n${timingText(payload)}`;
   });
 }
 
@@ -184,9 +188,9 @@ async function runModuleB() {
     state.moduleBGlobalPrediction = payload.global_prediction;
     updateModuleBOverlay();
     if (!payload.prediction) {
-      return "Prediction: not completed / invalid";
+      return `Prediction: not completed / invalid\n${timingText(payload)}`;
     }
-    return `Local window: ${payload.prediction.map(seconds).join(" - ")}\nGlobal window: ${payload.global_prediction.map(seconds).join(" - ")}`;
+    return `Local window: ${payload.prediction.map(seconds).join(" - ")}\nGlobal window: ${payload.global_prediction.map(seconds).join(" - ")}\n${timingText(payload)}`;
   });
 }
 
@@ -199,9 +203,9 @@ async function runModuleC() {
   };
   await runModule("/api/module-c", body, elements.moduleCParsed, elements.moduleCRaw, (payload) => {
     if (!payload.prediction) {
-      return "Prediction: invalid JSON";
+      return `Prediction: invalid JSON\n${timingText(payload)}`;
     }
-    return `Mistake: ${payload.prediction.mistake}\nReasoning: ${payload.prediction.reasoning}`;
+    return `Mistake: ${payload.prediction.mistake}\nReasoning: ${payload.prediction.reasoning}\n${timingText(payload)}`;
   });
 }
 

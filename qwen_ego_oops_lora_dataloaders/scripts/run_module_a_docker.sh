@@ -69,6 +69,7 @@ WANDB_ARTIFACT_PREFIX="${WANDB_ARTIFACT_PREFIX:-module-a}"
 EVAL_GENERATION_MAX_SAMPLES="${EVAL_GENERATION_MAX_SAMPLES:--1}"
 EVAL_GENERATION_MAX_NEW_TOKENS="${EVAL_GENERATION_MAX_NEW_TOKENS:-8}"
 GENERATION_EVAL_MODE="${GENERATION_EVAL_MODE:-subprocess}"
+MODULE_A_LABEL_MODE="${MODULE_A_LABEL_MODE:-step_id}"
 FPS="${FPS:-1.0}"
 MIN_FRAMES="${MIN_FRAMES:-2}"
 MAX_FRAMES="${MAX_FRAMES:-32}"
@@ -115,6 +116,7 @@ fi
 TRAIN_ARGS=(
   python scripts/train_module_a_unsloth.py
   --model-name "${MODEL_NAME}"
+  --module-a-label-mode "${MODULE_A_LABEL_MODE}"
   --lora-r "${LORA_R}"
   --lora-alpha "${LORA_ALPHA}"
   --lora-dropout "${LORA_DROPOUT}"

@@ -415,11 +415,14 @@ def temporal_metrics(
     else:
         metrics["eval_temporal/no_action_accuracy"] = 0.0
         metrics["eval_temporal/no_action_false_positive_rate"] = 0.0
-    for threshold in (0.1, 0.3, 0.5):
+    for threshold in (0.1, 0.3, 0.5, 0.7, 0.9):
         hits = sum(1 for value in ious if value >= threshold)
-        metrics[f"eval_temporal/recall_at_{threshold:.1f}"] = hits / len(positives) if positives else 0.0
+        recall = hits / len(positives) if positives else 0.0
+        precision = hits / len(valid) if valid else 0.0
+        metrics[f"eval_temporal/recall_at_{threshold:.1f}"] = recall
+        metrics[f"eval_temporal/precision_at_{threshold:.1f}"] = precision
         metrics[f"eval_temporal/f1_at_{threshold:.1f}"] = (
-            2 * hits / (len(valid) + len(positives)) if valid or positives else 0.0
+            2 * precision * recall / (precision + recall) if precision + recall else 0.0
         )
     if valid:
         start_errors = [abs(pred[0] - target[0]) for target, pred in valid]

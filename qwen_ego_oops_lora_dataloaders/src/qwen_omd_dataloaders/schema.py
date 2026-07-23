@@ -48,6 +48,8 @@ class WindowSpec:
     label: str
     completed_steps: tuple[str, ...] = ()
     pending_steps: tuple[str, ...] = ()
+    all_instructions: tuple[str, ...] = ()
+    label_mode: str = "legacy"
 
     @property
     def duration(self) -> float:

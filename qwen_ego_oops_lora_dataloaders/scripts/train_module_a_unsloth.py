@@ -28,6 +28,10 @@ from qwen_omd_dataloaders.build import (  # noqa: E402
 )
 from qwen_omd_dataloaders.config import ModuleAConfig  # noqa: E402
 from qwen_omd_dataloaders.datasets import EgoOopsModuleADataset, EgoOopsProvider  # noqa: E402
+from qwen_omd_dataloaders.datasets.ego_oops import (  # noqa: E402
+    MODULE_A_STEP_ID_NONE_LETTER,
+    is_module_a_completion_label,
+)
 from qwen_omd_dataloaders.schema import TrainingExample  # noqa: E402
 
 MODULE_A_SYSTEM_PROMPT = (
@@ -35,10 +39,19 @@ MODULE_A_SYSTEM_PROMPT = (
     "current step, and pending steps, answer WAIT or COMPLETE. Say COMPLETE when the attempt at "
     "the current step has ended, even if it included mistakes; otherwise say WAIT."
 )
+MODULE_A_STEP_ID_SYSTEM_PROMPT = (
+    "You are a procedural step-completion identifier. Given a video clip, the task name and "
+    "description, the steps already done, and the full instruction list, reply with exactly one "
+    "choice letter. A means no step was completed yet or the attempt is truncated. B means an "
+    "extra step outside the listed instructions just finished. C and later letters mean that "
+    "listed instruction attempt just finished. Mistakes of the listed types are allowed inside a "
+    "step. Do not assume steps occur in recipe order."
+)
 DEFAULT_OUTPUT_DIR = "/home/amit/online_mistake_detection/outputs/module_a_qwen35_2b_lora_wait_complete_vision"
 MODULE_A_SPLIT_VERSION = 1
 MODULE_A_LABELS = ("WAIT", "COMPLETE")
 MODULE_A_POSITIVE_LABEL = "COMPLETE"
+MODULE_A_STEP_ID_POSITIVE_NOT = MODULE_A_STEP_ID_NONE_LETTER
 
 
 def release_cuda_memory() -> None:
@@ -158,16 +171,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--negative-to-positive-ratio", type=int, default=2)
     parser.add_argument("--keep-last-wait-windows", type=int, default=2)
     parser.add_argument(
+        "--module-a-label-mode",
+        choices=("legacy", "step_id"),
+        default="step_id",
+        help="legacy=WAIT/COMPLETE with GT current step; step_id=A/B/C+ open-set step completion ID.",
+    )
+    parser.add_argument(
         "--positive-oversample-factor",
         type=float,
         default=1.0,
-        help="Train-only COMPLETE oversampling factor. 1.0 keeps the natural split.",
+        help="Train-only positive oversampling factor. 1.0 keeps the natural split.",
     )
     parser.add_argument(
         "--positive-loss-weight",
         type=float,
         default=1.0,
-        help="Train-time loss multiplier for COMPLETE assistant response tokens.",
+        help="Train-time loss multiplier for positive assistant response tokens.",
     )
 
     # Model / LoRA
@@ -420,6 +439,7 @@ def build_module_a_dataset(args: argparse.Namespace) -> EgoOopsModuleADataset:
         negative_to_positive_ratio=args.negative_to_positive_ratio,
         keep_last_wait_windows=args.keep_last_wait_windows,
         seed=args.seed,
+        label_mode=args.module_a_label_mode,
     )
     return EgoOopsModuleADataset(provider, config=config)
 
@@ -455,6 +475,7 @@ def data_config_for_split(args: argparse.Namespace) -> dict[str, Any]:
         "completion_margin": args.completion_margin,
         "negative_to_positive_ratio": args.negative_to_positive_ratio,
         "keep_last_wait_windows": args.keep_last_wait_windows,
+        "label_mode": args.module_a_label_mode,
     }
 
 
@@ -564,7 +585,10 @@ def oversample_positive_conversations(
         return list(conversations)
     positives = [
         item for item in conversations
-        if label_to_positive(str(item.get("target", "")))
+        if label_to_positive(
+            str(item.get("target", "")),
+            label_mode=str(item.get("label_mode") or "legacy"),
+        )
     ]
     if not positives:
         return list(conversations)
@@ -588,7 +612,10 @@ def apply_positive_loss_weights(
     for item in conversations:
         item["loss_weight"] = (
             positive_weight
-            if label_to_positive(str(item.get("target", "")))
+            if label_to_positive(
+                str(item.get("target", "")),
+                label_mode=str(item.get("label_mode") or "legacy"),
+            )
             else 1.0
         )
 
@@ -618,6 +645,10 @@ def training_example_to_conversation(
     min_frames: int,
     max_frames: int,
 ) -> dict[str, Any]:
+    label_mode = str((example.metadata or {}).get("label_mode") or "legacy")
+    system_prompt = (
+        MODULE_A_STEP_ID_SYSTEM_PROMPT if label_mode == "step_id" else MODULE_A_SYSTEM_PROMPT
+    )
     return {
         "messages": [
             {
@@ -625,7 +656,7 @@ def training_example_to_conversation(
                 "content": [
                     {
                         "type": "text",
-                        "text": MODULE_A_SYSTEM_PROMPT,
+                        "text": system_prompt,
                     }
                 ],
             },
@@ -663,6 +694,7 @@ def training_example_to_conversation(
         "window_start": example.window_start,
         "window_end": example.window_end,
         "target": example.target_text,
+        "label_mode": label_mode,
         "loss_weight": 1.0,
     }
 
@@ -765,8 +797,8 @@ def save_run_config(
     print(f"Saved run config to: {config_path}")
 
 
-def label_to_positive(label: str) -> bool:
-    return label.strip().strip("[]") == MODULE_A_POSITIVE_LABEL
+def label_to_positive(label: str, *, label_mode: str = "legacy") -> bool:
+    return is_module_a_completion_label(label, label_mode=label_mode)
 
 
 def binary_detection_metrics(
@@ -775,11 +807,12 @@ def binary_detection_metrics(
     *,
     prefix: str,
     beta: float = 2.0,
+    label_mode: str = "legacy",
 ) -> dict[str, float]:
     tp = fp = tn = fn = 0
     for target, prediction in zip(targets, predictions):
-        target_positive = label_to_positive(target)
-        predicted_positive = label_to_positive(prediction)
+        target_positive = label_to_positive(target, label_mode=label_mode)
+        predicted_positive = label_to_positive(prediction, label_mode=label_mode)
         if target_positive and predicted_positive:
             tp += 1
         elif not target_positive and predicted_positive:
@@ -821,7 +854,161 @@ def binary_detection_metrics(
     }
 
 
-def extract_module_a_label(text: str) -> str:
+def multiclass_letter_metrics(
+    targets: list[str],
+    predictions: list[str],
+    *,
+    prefix: str = "eval_step_id",
+) -> dict[str, float]:
+    normalized_targets = [extract_module_a_label(target, label_mode="step_id") for target in targets]
+    normalized_preds = [extract_module_a_label(prediction, label_mode="step_id") for prediction in predictions]
+    total = len(normalized_targets)
+    correct = sum(1 for target, prediction in zip(normalized_targets, normalized_preds) if target == prediction)
+    labels = sorted(set(normalized_targets) | set(normalized_preds))
+    metrics: dict[str, float] = {
+        f"{prefix}/accuracy": (correct / total) if total else 0.0,
+        f"{prefix}/num_samples": float(total),
+        f"{prefix}/num_classes": float(len(labels)),
+    }
+
+    per_class_f1: list[float] = []
+    weighted_f1_sum = 0.0
+    support_sum = 0
+    micro_tp = micro_fp = micro_fn = 0
+
+    for label in labels:
+        tp = sum(1 for t, p in zip(normalized_targets, normalized_preds) if t == label and p == label)
+        fp = sum(1 for t, p in zip(normalized_targets, normalized_preds) if t != label and p == label)
+        fn = sum(1 for t, p in zip(normalized_targets, normalized_preds) if t == label and p != label)
+        support = sum(1 for t in normalized_targets if t == label)
+        pred_count = sum(1 for p in normalized_preds if p == label)
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        metrics[f"{prefix}/support_{label}"] = float(support)
+        metrics[f"{prefix}/pred_{label}"] = float(pred_count)
+        metrics[f"{prefix}/tp_{label}"] = float(tp)
+        metrics[f"{prefix}/precision_{label}"] = precision
+        metrics[f"{prefix}/recall_{label}"] = recall
+        metrics[f"{prefix}/f1_{label}"] = f1
+        if support > 0:
+            per_class_f1.append(f1)
+            weighted_f1_sum += f1 * support
+            support_sum += support
+        micro_tp += tp
+        micro_fp += fp
+        micro_fn += fn
+
+    micro_precision = micro_tp / (micro_tp + micro_fp) if micro_tp + micro_fp else 0.0
+    micro_recall = micro_tp / (micro_tp + micro_fn) if micro_tp + micro_fn else 0.0
+    metrics[f"{prefix}/macro_f1"] = (
+        sum(per_class_f1) / len(per_class_f1) if per_class_f1 else 0.0
+    )
+    metrics[f"{prefix}/weighted_f1"] = (
+        weighted_f1_sum / support_sum if support_sum else 0.0
+    )
+    metrics[f"{prefix}/micro_f1"] = (
+        2 * micro_precision * micro_recall / (micro_precision + micro_recall)
+        if micro_precision + micro_recall
+        else 0.0
+    )
+    metrics[f"{prefix}/micro_precision"] = micro_precision
+    metrics[f"{prefix}/micro_recall"] = micro_recall
+
+    for true_label in labels:
+        for pred_label in labels:
+            count = sum(
+                1
+                for t, p in zip(normalized_targets, normalized_preds)
+                if t == true_label and p == pred_label
+            )
+            metrics[f"{prefix}/cm_{true_label}_{pred_label}"] = float(count)
+
+    gate = binary_detection_metrics(
+        normalized_targets,
+        normalized_preds,
+        prefix=f"{prefix}/gate",
+        label_mode="step_id",
+    )
+    metrics.update(gate)
+    return metrics
+
+
+def confusion_matrix_from_metrics(
+    metrics: dict[str, float],
+    *,
+    prefix: str = "eval_step_id",
+) -> dict[str, Any]:
+    labels: set[str] = set()
+    token = f"{prefix}/cm_"
+    for key in metrics:
+        if not key.startswith(token):
+            continue
+        remainder = key[len(token) :]
+        if "_" not in remainder:
+            continue
+        true_label, pred_label = remainder.split("_", 1)
+        labels.add(true_label)
+        labels.add(pred_label)
+    ordered = sorted(labels)
+    matrix = [
+        [int(metrics.get(f"{prefix}/cm_{true_label}_{pred_label}", 0.0)) for pred_label in ordered]
+        for true_label in ordered
+    ]
+    return {"labels": ordered, "matrix": matrix}
+
+
+def binary_roc_auc(y_true: list[int], y_score: list[float]) -> float | None:
+    """Trapezoidal ROC-AUC for binary labels in {0,1}. Returns None if undefined."""
+    if len(y_true) != len(y_score) or not y_true:
+        return None
+    positives = sum(y_true)
+    negatives = len(y_true) - positives
+    if positives == 0 or negatives == 0:
+        return None
+    ranked = sorted(zip(y_score, y_true), key=lambda item: item[0])
+    tp = fp = 0
+    prev_score = None
+    points: list[tuple[float, float]] = [(0.0, 0.0)]
+    for score, label in reversed(ranked):
+        if prev_score is not None and score != prev_score:
+            points.append((fp / negatives, tp / positives))
+        if label == 1:
+            tp += 1
+        else:
+            fp += 1
+        prev_score = score
+    points.append((fp / negatives, tp / positives))
+    points.append((1.0, 1.0))
+    auc = 0.0
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        auc += (x1 - x0) * (y0 + y1) / 2.0
+    return float(auc)
+
+
+def scores_to_probabilities(scores: dict[str, float]) -> dict[str, float]:
+    """Convert label NLLs to a simplex via softmax(-nll)."""
+    if not scores:
+        return {}
+    import math
+
+    negated = {label: -float(value) for label, value in scores.items()}
+    max_value = max(negated.values())
+    exps = {label: math.exp(value - max_value) for label, value in negated.items()}
+    total = sum(exps.values())
+    if total <= 0:
+        uniform = 1.0 / len(scores)
+        return {label: uniform for label in scores}
+    return {label: value / total for label, value in exps.items()}
+
+
+def extract_module_a_label(text: str, *, label_mode: str = "legacy") -> str:
+    if label_mode == "step_id":
+        normalized = text.strip().upper()
+        for char in normalized:
+            if "A" <= char <= "Z":
+                return char
+        return MODULE_A_STEP_ID_NONE_LETTER
     for label in MODULE_A_LABELS:
         if label in text.strip().strip("[]").upper():
             return label
@@ -1087,11 +1274,12 @@ class ModuleADetectionMetricsCallback:
         try:
             with torch.inference_mode():
                 for example in self.eval_examples:
+                    label_mode = str(example.get("label_mode") or "legacy")
                     if self.label_score_eval:
                         prediction = self._score_label(model, example)
                     else:
                         generated_text = self._generate_label(model, example)
-                        prediction = extract_module_a_label(generated_text)
+                        prediction = extract_module_a_label(generated_text, label_mode=label_mode)
                     target = str(example["target"])
                     task_id = str(example["task_id"])
                     predictions.append(prediction)
@@ -1103,13 +1291,33 @@ class ModuleADetectionMetricsCallback:
                 FastVisionModel.for_training(model)
             release_cuda_memory()
 
-        metrics = binary_detection_metrics(targets, predictions, prefix="eval_detection", beta=self.beta)
+        label_mode = str(self.eval_examples[0].get("label_mode") or "legacy") if self.eval_examples else "legacy"
+        if label_mode == "step_id":
+            metrics = multiclass_letter_metrics(targets, predictions, prefix="eval_step_id")
+            metrics.update(
+                binary_detection_metrics(
+                    targets,
+                    predictions,
+                    prefix="eval_detection",
+                    beta=self.beta,
+                    label_mode="step_id",
+                )
+            )
+        else:
+            metrics = binary_detection_metrics(
+                targets,
+                predictions,
+                prefix="eval_detection",
+                beta=self.beta,
+                label_mode="legacy",
+            )
         for task_id in sorted(task_targets):
             task_metrics = binary_detection_metrics(
                 task_targets[task_id],
                 task_predictions[task_id],
                 prefix=f"eval_detection/task_{task_id}",
                 beta=self.beta,
+                label_mode=label_mode,
             )
             metrics.update({
                 key: value
@@ -1180,11 +1388,36 @@ class ModuleADetectionMetricsCallback:
             release_cuda_memory()
 
     def _score_label(self, model: Any, example: dict[str, Any]) -> str:
+        scores = self._score_label_nlls(model, example)
+        return min(scores, key=scores.get)
+
+    def _candidate_labels_for_example(self, example: dict[str, Any]) -> list[str]:
+        label_mode = str(example.get("label_mode") or "legacy")
+        if label_mode != "step_id":
+            return list(MODULE_A_LABELS)
+        candidate_labels = [MODULE_A_STEP_ID_NONE_LETTER, "B"]
+        user_text = ""
+        for message in example.get("messages", []):
+            if message.get("role") != "user":
+                continue
+            for part in message.get("content", []):
+                if isinstance(part, dict) and part.get("type") == "text":
+                    user_text = str(part.get("text") or "")
+        for line in user_text.splitlines():
+            stripped = line.strip()
+            if len(stripped) >= 2 and stripped[1] == "." and "C" <= stripped[0].upper() <= "Z":
+                letter = stripped[0].upper()
+                if letter not in candidate_labels:
+                    candidate_labels.append(letter)
+        return candidate_labels
+
+    def _score_label_nlls(self, model: Any, example: dict[str, Any]) -> dict[str, float]:
         import torch
 
-        scores = {}
+        candidate_labels = self._candidate_labels_for_example(example)
+        scores: dict[str, float] = {}
         device = next(model.parameters()).device
-        for label in MODULE_A_LABELS:
+        for label in candidate_labels:
             scored_example = copy.deepcopy(example)
             for message in scored_example["messages"]:
                 if message.get("role") == "assistant":
@@ -1217,7 +1450,7 @@ class ModuleADetectionMetricsCallback:
                 if "logits" in locals():
                     del logits
                 release_cuda_memory()
-        return min(scores, key=scores.get)
+        return scores
 
 
 def compute_generation_detection_metrics(
@@ -1226,7 +1459,7 @@ def compute_generation_detection_metrics(
     tokenizer: Any,
     eval_examples: list[dict[str, Any]],
     args: argparse.Namespace,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     data_collator = Qwen3VLMetadataVisionDataCollator(
         model,
         tokenizer,
@@ -1250,13 +1483,21 @@ def compute_generation_detection_metrics(
     targets: list[str] = []
     task_targets: dict[str, list[str]] = defaultdict(list)
     task_predictions: dict[str, list[str]] = defaultdict(list)
+    binary_scores: list[float] = []
+    binary_truth: list[int] = []
+    class_scores: dict[str, list[float]] = defaultdict(list)
+    class_truth: dict[str, list[int]] = defaultdict(list)
+    all_score_labels: set[str] = set()
 
     for example in generator.eval_examples:
+        label_mode = str(example.get("label_mode") or args.module_a_label_mode)
+        score_map: dict[str, float] | None = None
         if args.label_score_eval:
-            prediction = generator._score_label(model, example)
+            score_map = generator._score_label_nlls(model, example)
+            prediction = min(score_map, key=score_map.get)
         else:
             generated_text = generator._generate_label(model, example)
-            prediction = extract_module_a_label(generated_text)
+            prediction = extract_module_a_label(generated_text, label_mode=label_mode)
         target = str(example["target"])
         task_id = str(example["task_id"])
         predictions.append(prediction)
@@ -1264,18 +1505,97 @@ def compute_generation_detection_metrics(
         task_predictions[task_id].append(prediction)
         task_targets[task_id].append(target)
 
-    metrics = binary_detection_metrics(targets, predictions, prefix="eval_detection", beta=args.fbeta_beta)
+        if score_map is not None and label_mode == "step_id":
+            probs = scores_to_probabilities(score_map)
+            all_score_labels.update(probs)
+            target_letter = extract_module_a_label(target, label_mode="step_id")
+            completion_prob = sum(
+                prob for letter, prob in probs.items() if letter != MODULE_A_STEP_ID_NONE_LETTER
+            )
+            binary_scores.append(completion_prob)
+            binary_truth.append(1 if label_to_positive(target_letter, label_mode="step_id") else 0)
+            for letter in sorted(set(probs) | {target_letter}):
+                class_scores[letter].append(float(probs.get(letter, 0.0)))
+                class_truth[letter].append(1 if target_letter == letter else 0)
+
+    label_mode = str(args.module_a_label_mode)
+    if label_mode == "step_id":
+        metrics: dict[str, Any] = multiclass_letter_metrics(
+            targets,
+            predictions,
+            prefix="eval_step_id",
+        )
+        metrics.update(
+            binary_detection_metrics(
+                targets,
+                predictions,
+                prefix="eval_detection",
+                beta=args.fbeta_beta,
+                label_mode="step_id",
+            )
+        )
+        metrics["confusion_matrix"] = confusion_matrix_from_metrics(
+            metrics,
+            prefix="eval_step_id",
+        )
+    else:
+        metrics = binary_detection_metrics(
+            targets,
+            predictions,
+            prefix="eval_detection",
+            beta=args.fbeta_beta,
+            label_mode="legacy",
+        )
+        metrics["confusion_matrix"] = {
+            "labels": ["WAIT", "COMPLETE"],
+            "matrix": [
+                [
+                    sum(
+                        1
+                        for t, p in zip(targets, predictions)
+                        if extract_module_a_label(t, label_mode="legacy") == row
+                        and extract_module_a_label(p, label_mode="legacy") == col
+                    )
+                    for col in ("WAIT", "COMPLETE")
+                ]
+                for row in ("WAIT", "COMPLETE")
+            ],
+        }
+
+    if binary_scores:
+        gate_auc = binary_roc_auc(binary_truth, binary_scores)
+        if gate_auc is not None:
+            metrics["eval_detection/auc"] = gate_auc
+            metrics["eval_step_id/gate/auc"] = gate_auc
+        ovr_aucs: list[float] = []
+        for letter in sorted(all_score_labels):
+            auc = binary_roc_auc(class_truth[letter], class_scores[letter])
+            if auc is None:
+                continue
+            metrics[f"eval_step_id/auc_{letter}"] = auc
+            ovr_aucs.append(auc)
+        if ovr_aucs:
+            metrics["eval_step_id/macro_auc"] = sum(ovr_aucs) / len(ovr_aucs)
+    else:
+        metrics["eval_detection/auc"] = None
+        metrics["eval_step_id/macro_auc"] = None
+        metrics["auc_note"] = (
+            "AUC requires --label-score-eval so soft label NLLs are available; "
+            "hard generation-only predictions cannot define a ranking score."
+        )
+
     for task_id in sorted(task_targets):
         task_metrics = binary_detection_metrics(
             task_targets[task_id],
             task_predictions[task_id],
             prefix=f"eval_detection/task_{task_id}",
             beta=args.fbeta_beta,
+            label_mode=label_mode,
         )
         metrics.update({
             key: value
             for key, value in task_metrics.items()
-            if key.endswith(("/accuracy", "/f1", "/recall", "/num_samples"))
+            if key.endswith(("/accuracy", "/f1", "/recall", "/precision", "/num_samples"))
         })
     return metrics
 
@@ -1326,6 +1646,8 @@ def build_generation_eval_command(
         str(args.eval_generation_max_new_tokens),
         "--fbeta-beta",
         str(args.fbeta_beta),
+        "--module-a-label-mode",
+        str(args.module_a_label_mode),
         "--output-dir",
         str(args.output_dir),
         "--seed",
@@ -1773,7 +2095,7 @@ def run_generation_eval_only(
     val_conversations: list[dict[str, Any]],
 ) -> None:
     if args.eval_generation_max_samples == 0:
-        metrics: dict[str, float] = {}
+        metrics: dict[str, Any] = {}
     else:
         model, tokenizer = load_generation_eval_model(args)
         metrics = compute_generation_detection_metrics(
@@ -1785,8 +2107,12 @@ def run_generation_eval_only(
         del model
         release_cuda_memory()
 
+    confusion_matrix = metrics.pop("confusion_matrix", None) if isinstance(metrics, dict) else None
+    auc_note = metrics.pop("auc_note", None) if isinstance(metrics, dict) else None
     payload = {
         "checkpoint": args.eval_checkpoint,
+        "module_a_label_mode": args.module_a_label_mode,
+        "label_score_eval": bool(args.label_score_eval),
         "num_validation_examples": len(val_conversations),
         "num_generation_examples": (
             len(val_conversations)
@@ -1794,6 +2120,8 @@ def run_generation_eval_only(
             else min(args.eval_generation_max_samples, len(val_conversations))
         ),
         "metrics": metrics,
+        "confusion_matrix": confusion_matrix,
+        "auc_note": auc_note,
     }
     if args.generation_eval_output_json:
         output_path = Path(args.generation_eval_output_json)

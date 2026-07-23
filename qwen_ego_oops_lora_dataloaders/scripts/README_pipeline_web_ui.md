@@ -37,10 +37,10 @@ python3 scripts/pipeline_web_ui.py \
   --max-videos 50 \
   --max-frames-a 16 \
   --max-frames-b 16 \
-  --max-frames-c 8 \
+  --max-frames-c 16 \
   --vision-resize-a 336 \
   --vision-resize-b 384 \
-  --vision-resize-c 336 \
+  --vision-resize-c 384 \
   --max-seq-length-a 3072 \
   --max-seq-length-b 5120 \
   --max-seq-length-c 3072 \
@@ -56,6 +56,38 @@ http://127.0.0.1:7860
 
 If you run inside Docker, publish the port and mount the checkpoint/video paths into the container.
 
+## Run With Docker
+
+From the same project directory:
+
+```bash
+bash scripts/run_pipeline_web_ui_docker.sh
+```
+
+The wrapper publishes port `7860`, mounts the video data, outputs, Hugging Face cache, and EgoOops annotations, and defaults to the locally downloaded best checkpoints:
+
+```text
+MODULE_A_CHECKPOINT=/home/amit/online_mistake_detection/outputs/module_a_qwen35_2b_lora_wait_complete_vision/runs/module_a_recall_loss2_from_ep8_to_ep50_v8/best_ep10
+MODULE_B_CHECKPOINT=/home/amit/online_mistake_detection/outputs/wandb_artifacts/module-b-9kahxivi-best_v1/best_ep7
+MODULE_C_CHECKPOINT=/home/amit/online_mistake_detection/outputs/module_c_qwen35_lora_reasoning/runs/module_c_16gb_2b_r16_16f384_seq3072/best_ep1
+```
+
+Override any of them if needed:
+
+```bash
+PORT=7861 \
+MODULE_B_CHECKPOINT=/path/to/other/module_b_checkpoint \
+bash scripts/run_pipeline_web_ui_docker.sh
+```
+
+Then open:
+
+```text
+http://127.0.0.1:7860
+```
+
+If the image was built before the web dependencies were added, the wrapper installs `fastapi` and `uvicorn` at startup by default. Set `INSTALL_WEB_DEPS=false` after rebuilding the Docker image with the updated `requirements.txt`.
+
 ## Usage Flow
 
 1. Select a video.
@@ -66,6 +98,11 @@ If you run inside Docker, publish the port and mount the checkpoint/video paths 
 6. Click `Run Module B` to get the localized attempted-step window. The UI overlays this prediction in green on the timeline.
 7. Click `Run Module C` to classify the Module B predicted crop as mistake/correct and show reasoning.
 8. Click `Unload GPU Model` if you want to explicitly free GPU memory.
+
+Each result panel shows:
+
+- `Prediction time`: time spent in the actual model prediction call for that module.
+- `Request wall time`: total click-to-response time, including checkpoint load/switch overhead if that module was not already active.
 
 ## Memory Behavior
 

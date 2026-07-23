@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import threading
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal
@@ -22,7 +22,18 @@ from pydantic import BaseModel, Field
 
 from qwen_omd_dataloaders.build import DEFAULT_METADATA_PATH, DEFAULT_MISTAKE_CLASSES_PATH, DEFAULT_VIDEO_ROOT
 from qwen_omd_dataloaders.datasets import EgoOopsProvider
-from qwen_omd_dataloaders.datasets.ego_oops import _module_b_prompt, _module_c_prompt
+from qwen_omd_dataloaders.datasets.ego_oops import (
+    EXTRA_STEP_INSTRUCTION,
+    MODULE_A_STEP_ID_EXTRA_LETTER,
+    MODULE_A_STEP_ID_NONE_LETTER,
+    _module_a_prompt,
+    _module_a_step_id_prompt,
+    _module_b_prompt,
+    _module_c_prompt,
+    is_module_a_completion_label,
+    module_a_instruction_for_step_id_letter,
+    module_a_step_id_letter_for_instruction_index,
+)
 from qwen_omd_dataloaders.schema import TrainingExample, VideoRecord, WindowSpec
 from qwen_omd_dataloaders.video import video_duration_seconds
 
@@ -50,9 +61,13 @@ STATIC_DIR = SCRIPT_ROOT / "pipeline_web_ui_static"
 
 class ClipRequest(BaseModel):
     video_id: str
-    step_index: int = Field(ge=0)
+    step_index: int = Field(ge=-1)
     clip_start: float = Field(ge=0.0)
     clip_end: float = Field(gt=0.0)
+    module_a_prediction: str | None = None
+    completed_steps: list[str] | None = None
+    next_clip_start_from_b: bool = False
+    predicted_global_end: float | None = Field(default=None, ge=0.0)
 
 
 class ModuleCRequest(ClipRequest):
@@ -81,6 +96,7 @@ class AppConfig(BaseModel):
     fps: float
     min_frames: int
     step_seconds: float
+    module_a_label_mode: str
     module_a: ModelSettings
     module_b: ModelSettings
     module_c: ModelSettings
@@ -147,6 +163,7 @@ class PipelineWebState:
         )
         self.records = list(provider.iter_video_records())
         self.records_by_id = {record.video_id: record for record in self.records}
+        self.mistake_classes = list(provider.mistake_classes)
         self.model_manager = SingleActiveModelManager(config)
 
     def get_record(self, video_id: str) -> VideoRecord:
@@ -171,12 +188,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--min-frames", type=int, default=2)
     parser.add_argument("--step-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--module-a-label-mode",
+        choices=("legacy", "step_id"),
+        default="step_id",
+        help="Module A prompt/parse mode for the UI.",
+    )
     parser.add_argument("--max-frames-a", type=int, default=16)
     parser.add_argument("--max-frames-b", type=int, default=16)
-    parser.add_argument("--max-frames-c", type=int, default=8)
+    parser.add_argument("--max-frames-c", type=int, default=16)
     parser.add_argument("--vision-resize-a", type=int, default=336)
     parser.add_argument("--vision-resize-b", type=int, default=384)
-    parser.add_argument("--vision-resize-c", type=int, default=336)
+    parser.add_argument("--vision-resize-c", type=int, default=384)
     parser.add_argument("--max-seq-length-a", type=int, default=3072)
     parser.add_argument("--max-seq-length-b", type=int, default=5120)
     parser.add_argument("--max-seq-length-c", type=int, default=3072)
@@ -203,6 +226,7 @@ def config_from_args(args: argparse.Namespace) -> AppConfig:
         fps=float(args.fps),
         min_frames=int(args.min_frames),
         step_seconds=float(args.step_seconds),
+        module_a_label_mode=str(args.module_a_label_mode),
         module_a=ModelSettings(
             max_frames=int(args.max_frames_a),
             vision_resize=int(args.vision_resize_a),
@@ -256,9 +280,10 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @app.post("/api/module-a")
     def run_module_a(request: ClipRequest) -> dict[str, Any]:
+        request_started = time.perf_counter()
         with state.model_manager.prediction_lock:
             record = state.get_record(request.video_id)
-            window = request_to_window(record, request)
+            window = request_to_window(record, request, label_mode=config.module_a_label_mode)
             model, tokenizer = state.model_manager.load("A")
             settings = config.module_a
             collator = make_collator(model, tokenizer, settings.max_seq_length, settings.vision_resize)
@@ -272,20 +297,40 @@ def create_app(config: AppConfig) -> FastAPI:
                 label_score_eval=False,
             )
             example = module_a_to_conversation(
-                window_to_example(window),
+                window_to_example(window, mistake_classes=state.mistake_classes),
                 fps=config.fps,
                 min_frames=config.min_frames,
                 max_frames=settings.max_frames,
             )
+            prediction_started = time.perf_counter()
             raw = generator._generate_label(model, example)
-            prediction = extract_module_a_label(raw)
-            return {"module": "A", "raw": raw, "prediction": prediction, "window": window_payload(window)}
+            prediction_seconds = time.perf_counter() - prediction_started
+            prediction = extract_module_a_label(raw, label_mode=config.module_a_label_mode)
+            resolved = module_a_instruction_for_step_id_letter(
+                prediction,
+                window.all_instructions or tuple(record.instructions),
+            )
+            return {
+                "module": "A",
+                "raw": raw,
+                "prediction": prediction,
+                "is_completion": is_module_a_completion_label(
+                    prediction,
+                    label_mode=config.module_a_label_mode,
+                ),
+                "resolved_instruction": resolved,
+                "prediction_seconds": prediction_seconds,
+                "request_wall_seconds": time.perf_counter() - request_started,
+                "window": window_payload(window),
+            }
 
     @app.post("/api/module-b")
     def run_module_b(request: ClipRequest) -> dict[str, Any]:
+        request_started = time.perf_counter()
         with state.model_manager.prediction_lock:
             record = state.get_record(request.video_id)
-            window = request_to_window(record, request)
+            window = request_to_window(record, request, label_mode=config.module_a_label_mode)
+            instruction = resolve_instruction_for_request(record, request, window)
             model, tokenizer = state.model_manager.load("B")
             settings = config.module_b
             collator = make_collator(model, tokenizer, settings.max_seq_length, settings.vision_resize)
@@ -296,28 +341,38 @@ def create_app(config: AppConfig) -> FastAPI:
                 max_samples=-1,
                 max_new_tokens=settings.max_new_tokens,
             )
-            example = module_b_example(window)
+            example = module_b_example(window, instruction=instruction)
             conversation = module_b_to_conversation(
                 example,
                 fps=config.fps,
                 min_frames=config.min_frames,
                 max_frames=settings.max_frames,
             )
+            prediction_started = time.perf_counter()
             raw = generator._generate_span(model, conversation)
+            prediction_seconds = time.perf_counter() - prediction_started
             parsed = parse_temporal_prediction(raw)
             global_span = None
+            next_clip_start = None
             if parsed is not None:
                 global_span = [window.window_start + parsed[0], window.window_start + parsed[1]]
+                if request.next_clip_start_from_b or config.module_a_label_mode == "step_id":
+                    next_clip_start = global_span[1]
             return {
                 "module": "B",
                 "raw": raw,
                 "prediction": None if parsed is None else list(parsed),
                 "global_prediction": global_span,
+                "instruction": instruction,
+                "next_clip_start": next_clip_start,
+                "prediction_seconds": prediction_seconds,
+                "request_wall_seconds": time.perf_counter() - request_started,
                 "window": window_payload(window),
             }
 
     @app.post("/api/module-c")
     def run_module_c(request: ModuleCRequest) -> dict[str, Any]:
+        request_started = time.perf_counter()
         with state.model_manager.prediction_lock:
             record = state.get_record(request.video_id)
             clip_start = request.predicted_start if request.predicted_start is not None else request.clip_start
@@ -327,8 +382,11 @@ def create_app(config: AppConfig) -> FastAPI:
                 step_index=request.step_index,
                 clip_start=float(clip_start),
                 clip_end=float(clip_end),
+                module_a_prediction=request.module_a_prediction,
+                completed_steps=request.completed_steps,
             )
-            window = request_to_window(record, c_request)
+            window = request_to_window(record, c_request, label_mode=config.module_a_label_mode)
+            instruction = resolve_instruction_for_request(record, c_request, window)
             model, tokenizer = state.model_manager.load("C")
             settings = config.module_c
             collator = make_collator(model, tokenizer, settings.max_seq_length, settings.vision_resize)
@@ -340,14 +398,24 @@ def create_app(config: AppConfig) -> FastAPI:
                 max_new_tokens=settings.max_new_tokens,
             )
             conversation = module_c_to_conversation(
-                module_c_example(window),
+                module_c_example(window, instruction=instruction),
                 fps=config.fps,
                 min_frames=config.min_frames,
                 max_frames=settings.max_frames,
             )
+            prediction_started = time.perf_counter()
             raw = generator._generate_json(model, conversation)
+            prediction_seconds = time.perf_counter() - prediction_started
             parsed = parse_module_c_prediction(raw)
-            return {"module": "C", "raw": raw, "prediction": parsed, "window": window_payload(window)}
+            return {
+                "module": "C",
+                "raw": raw,
+                "prediction": parsed,
+                "instruction": instruction,
+                "prediction_seconds": prediction_seconds,
+                "request_wall_seconds": time.perf_counter() - request_started,
+                "window": window_payload(window),
+            }
 
     @app.post("/api/unload-model")
     def unload_model() -> dict[str, Any]:
@@ -396,25 +464,77 @@ def video_detail(record: VideoRecord, step_seconds: float) -> dict[str, Any]:
     return payload
 
 
-def request_to_window(record: VideoRecord, request: ClipRequest) -> WindowSpec:
+def request_to_window(
+    record: VideoRecord,
+    request: ClipRequest,
+    *,
+    label_mode: str = "step_id",
+) -> WindowSpec:
     if request.clip_end <= request.clip_start:
         raise HTTPException(status_code=400, detail="clip_end must be greater than clip_start.")
     if request.step_index >= len(record.instructions):
         raise HTTPException(status_code=400, detail=f"step_index out of range: {request.step_index}")
+
+    clip_start = float(request.clip_start)
+    if request.next_clip_start_from_b and request.predicted_global_end is not None:
+        clip_start = float(request.predicted_global_end)
+
     gt_start, gt_end = nearest_segment_bounds(record, request.step_index)
+    all_instructions = tuple(record.instructions)
+    if label_mode == "step_id":
+        if request.step_index < 0:
+            current_step = EXTRA_STEP_INSTRUCTION
+            label = (
+                MODULE_A_STEP_ID_EXTRA_LETTER
+                if gt_end is not None and float(request.clip_end) >= gt_end
+                else MODULE_A_STEP_ID_NONE_LETTER
+            )
+        else:
+            current_step = record.instructions[request.step_index]
+            complete_letter = module_a_step_id_letter_for_instruction_index(request.step_index)
+            label = (
+                complete_letter
+                if gt_end is not None and float(request.clip_end) >= gt_end
+                else MODULE_A_STEP_ID_NONE_LETTER
+            )
+        if request.completed_steps is not None:
+            completed_steps = tuple(request.completed_steps)
+        elif request.step_index < 0:
+            completed_steps = tuple(
+                segment.instruction
+                for segment in record.segments
+                if segment.instruction_index >= 0 and segment.end <= clip_start + 1e-6
+            )
+        else:
+            completed_steps = tuple(record.instructions[: request.step_index])
+        pending_steps = tuple(
+            instruction
+            for index, instruction in enumerate(record.instructions)
+            if index != request.step_index and instruction not in completed_steps
+        )
+    else:
+        if request.step_index < 0:
+            raise HTTPException(status_code=400, detail="legacy mode requires step_index >= 0")
+        current_step = record.instructions[request.step_index]
+        label = "UNKNOWN" if gt_end is None else ("COMPLETE" if float(request.clip_end) >= gt_end else "WAIT")
+        completed_steps = tuple(record.instructions[: request.step_index])
+        pending_steps = tuple(record.instructions[request.step_index + 1 :])
+
     return WindowSpec(
         video_path=record.video_path,
         video_id=record.video_id,
         task_id=record.task_id,
         step_index=request.step_index,
-        current_step=record.instructions[request.step_index],
-        window_start=float(request.clip_start),
+        current_step=current_step,
+        window_start=clip_start,
         window_end=float(request.clip_end),
         gt_start=gt_start,
         gt_end=gt_end,
-        label="WAIT",
-        completed_steps=tuple(record.instructions[: request.step_index]),
-        pending_steps=tuple(record.instructions[request.step_index + 1 :]),
+        label=label,
+        completed_steps=completed_steps,
+        pending_steps=pending_steps,
+        all_instructions=all_instructions,
+        label_mode=label_mode,
     )
 
 
@@ -426,15 +546,39 @@ def nearest_segment_bounds(record: VideoRecord, step_index: int) -> tuple[float 
     return segment.start, segment.end
 
 
-def window_to_example(window: WindowSpec) -> TrainingExample:
-    prompt = (
-        "Completed Steps: "
-        f"{json.dumps(list(window.completed_steps), ensure_ascii=False)}\n"
-        f"Current Step: {window.current_step}\n"
-        "Pending Steps: "
-        f"{json.dumps(list(window.pending_steps), ensure_ascii=False)}\n"
-        "Status?"
-    )
+def resolve_instruction_for_request(
+    record: VideoRecord,
+    request: ClipRequest,
+    window: WindowSpec,
+) -> str:
+    if request.module_a_prediction:
+        mapped = module_a_instruction_for_step_id_letter(
+            request.module_a_prediction,
+            window.all_instructions or tuple(record.instructions),
+        )
+        if mapped is not None:
+            return mapped
+        if request.module_a_prediction.strip().upper().startswith(MODULE_A_STEP_ID_EXTRA_LETTER):
+            return EXTRA_STEP_INSTRUCTION
+    if window.step_index < 0:
+        return EXTRA_STEP_INSTRUCTION
+    return window.current_step
+
+
+def window_to_example(window: WindowSpec, *, mistake_classes: list[str]) -> TrainingExample:
+    if window.label_mode == "step_id":
+        prompt = _module_a_step_id_prompt(
+            task_id=window.task_id,
+            instructions=window.all_instructions or (),
+            completed_steps=window.completed_steps,
+            mistake_classes=mistake_classes,
+        )
+    else:
+        prompt = _module_a_prompt(
+            completed_steps=window.completed_steps,
+            current_step=window.current_step,
+            pending_steps=window.pending_steps,
+        )
     return TrainingExample(
         module="A",
         source_dataset="ego_oops",
@@ -445,14 +589,21 @@ def window_to_example(window: WindowSpec) -> TrainingExample:
         window_start=window.window_start,
         window_end=window.window_end,
         prompt_text=prompt,
-        target_text="WAIT",
+        target_text=window.label,
         gt_start=window.gt_start,
         gt_end=window.gt_end,
         label=window.label,
+        metadata={
+            "label_mode": window.label_mode,
+            "all_instructions": list(window.all_instructions),
+            "completed_steps": list(window.completed_steps),
+            "mistake_classes": list(mistake_classes),
+        },
     )
 
 
-def module_b_example(window: WindowSpec) -> TrainingExample:
+def module_b_example(window: WindowSpec, *, instruction: str | None = None) -> TrainingExample:
+    resolved = instruction or window.current_step
     return TrainingExample(
         module="B",
         source_dataset="ego_oops",
@@ -462,16 +613,17 @@ def module_b_example(window: WindowSpec) -> TrainingExample:
         step_index=window.step_index,
         window_start=window.window_start,
         window_end=window.window_end,
-        prompt_text=_module_b_prompt(window.current_step),
+        prompt_text=_module_b_prompt(resolved),
         target_text="not completed",
         gt_start=window.gt_start,
         gt_end=window.gt_end,
         label="LOCALIZE",
-        metadata={"instruction": window.current_step},
+        metadata={"instruction": resolved},
     )
 
 
-def module_c_example(window: WindowSpec) -> TrainingExample:
+def module_c_example(window: WindowSpec, *, instruction: str | None = None) -> TrainingExample:
+    resolved = instruction or window.current_step
     return TrainingExample(
         module="C",
         source_dataset="ego_oops",
@@ -481,11 +633,11 @@ def module_c_example(window: WindowSpec) -> TrainingExample:
         step_index=window.step_index,
         window_start=window.window_start,
         window_end=window.window_end,
-        prompt_text=_module_c_prompt(window.current_step),
+        prompt_text=_module_c_prompt(resolved),
         target_text='{"mistake":false,"reasoning":""}',
         gt_start=window.gt_start,
         gt_end=window.gt_end,
-        metadata={"instruction": window.current_step},
+        metadata={"instruction": resolved},
     )
 
 

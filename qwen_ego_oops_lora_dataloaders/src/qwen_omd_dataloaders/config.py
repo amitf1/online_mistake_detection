@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -12,6 +13,9 @@ class VideoSamplingConfig:
     resize_short_side: int | None = None
 
 
+ModuleALabelMode = Literal["legacy", "step_id"]
+
+
 @dataclass(frozen=True)
 class ModuleAConfig:
     stride_seconds: float = 5.0
@@ -19,6 +23,7 @@ class ModuleAConfig:
     negative_to_positive_ratio: int = 2
     keep_last_wait_windows: int = 2
     seed: int = 13
+    label_mode: ModuleALabelMode = "step_id"
 
 
 @dataclass(frozen=True)

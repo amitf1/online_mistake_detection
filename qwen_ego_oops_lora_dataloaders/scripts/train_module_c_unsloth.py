@@ -37,6 +37,7 @@ from train_module_a_unsloth import (  # noqa: E402
     grouped_video_ids,
     is_bf16_available,
     json_safe,
+    load_generation_eval_model,
     load_unsloth_model,
     release_cuda_memory,
     save_outputs,
@@ -128,6 +129,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-seq-length", type=int, default=8192)
     parser.add_argument("--eval-generation-max-samples", type=int, default=-1)
     parser.add_argument("--eval-generation-max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--generation-eval-only",
+        action="store_true",
+        help="Skip training and run Module C generation metrics on the validation split only.",
+    )
+    parser.add_argument(
+        "--eval-checkpoint",
+        default=None,
+        help="LoRA checkpoint directory for --generation-eval-only.",
+    )
+    parser.add_argument(
+        "--generation-eval-output-json",
+        default=None,
+        help="Optional path to write generation-eval-only metrics JSON.",
+    )
     parser.add_argument("--output-dir", default="outputs/module_c_qwen35_lora_reasoning")
     parser.add_argument("--report-to", default="tensorboard")
     parser.add_argument("--dataset-num-proc", type=int, default=1)
@@ -153,6 +169,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("checkpoint retention counts cannot be negative.")
     if args.eval_generation_max_samples < -1:
         parser.error("--eval-generation-max-samples must be -1, 0, or positive.")
+    if args.generation_eval_only and not args.eval_checkpoint:
+        parser.error("--generation-eval-only requires --eval-checkpoint.")
+    if args.generation_eval_only and args.dry_run:
+        parser.error("--generation-eval-only cannot be combined with --dry-run.")
     validate_lora_target_configuration(args, parser.error)
     return args
 
@@ -708,6 +728,102 @@ def build_trainer(
     return trainer
 
 
+def run_generation_eval_only(
+    *,
+    args: argparse.Namespace,
+    val_conversations: list[dict[str, Any]],
+) -> None:
+    import torch
+    from unsloth import FastVisionModel
+
+    if args.eval_generation_max_samples == 0:
+        metrics: dict[str, float] = {}
+        predictions: list[dict[str, Any]] = []
+    else:
+        model, tokenizer = load_generation_eval_model(args)
+        collator = Qwen3VLMetadataVisionDataCollator(
+            model,
+            tokenizer,
+            max_seq_length=args.max_seq_length,
+            resize=args.vision_resize,
+            train_on_responses_only=True,
+            instruction_part="<|im_start|>user\n",
+            response_part="<|im_start|>assistant\n",
+            completion_only_loss=True,
+        )
+        generator = ModuleCMistakeMetricsCallback(
+            eval_examples=val_conversations,
+            data_collator=collator,
+            tokenizer=tokenizer,
+            max_samples=args.eval_generation_max_samples,
+            max_new_tokens=args.eval_generation_max_new_tokens,
+        )
+        predictions = []
+        pred_labels: list[bool | None] = []
+        target_labels: list[bool] = []
+        predicted_reasonings: list[str | None] = []
+        target_reasonings: list[str] = []
+        FastVisionModel.for_inference(model)
+        try:
+            with torch.inference_mode():
+                for example in generator.eval_examples:
+                    generated_text = generator._generate_json(model, example)
+                    parsed = parse_module_c_prediction(generated_text)
+                    pred_mistake = None if parsed is None else bool(parsed["mistake"])
+                    pred_reasoning = None if parsed is None else str(parsed["reasoning"])
+                    pred_labels.append(pred_mistake)
+                    predicted_reasonings.append(pred_reasoning)
+                    target_labels.append(bool(example.get("mistake")))
+                    target_reasonings.append(str(example.get("reasoning") or ""))
+                    predictions.append(
+                        {
+                            "video_id": example.get("video_id"),
+                            "task_id": example.get("task_id"),
+                            "step_index": example.get("step_index"),
+                            "window_start": example.get("window_start"),
+                            "window_end": example.get("window_end"),
+                            "gt_mistake": bool(example.get("mistake")),
+                            "gt_reasoning": example.get("reasoning"),
+                            "pred_mistake": pred_mistake,
+                            "pred_reasoning": pred_reasoning,
+                            "raw": generated_text,
+                        }
+                    )
+        finally:
+            del model
+            disable_unsloth_extra_outputs()
+            release_cuda_memory()
+        metrics = module_c_metrics(
+            target_labels,
+            pred_labels,
+            target_reasonings=target_reasonings,
+            predicted_reasonings=predicted_reasonings,
+        )
+
+    payload = {
+        "checkpoint": args.eval_checkpoint,
+        "num_validation_examples": len(val_conversations),
+        "num_generation_examples": (
+            len(val_conversations)
+            if args.eval_generation_max_samples < 0
+            else min(args.eval_generation_max_samples, len(val_conversations))
+        ),
+        "eval_max_frames": args.eval_max_frames,
+        "vision_resize": args.vision_resize,
+        "max_seq_length": args.max_seq_length,
+        "metrics": metrics,
+        "predictions": predictions,
+    }
+    if args.generation_eval_output_json:
+        output_path = Path(args.generation_eval_output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as file:
+            json.dump(json_safe(payload), file, indent=2, sort_keys=True, ensure_ascii=False)
+            file.write("\n")
+        print(f"Saved Module C generation eval to: {output_path}")
+    print(json.dumps(json_safe({key: value for key, value in payload.items() if key != "predictions"}), indent=2, sort_keys=True))
+
+
 def print_dry_run(
     dataset: EgoOopsModuleCDataset,
     train_conversations: list[dict[str, Any]],
@@ -759,6 +875,14 @@ def main() -> None:
     )
     if not train_conversations or not val_conversations:
         raise ValueError("Train/validation split produced an empty conversation split.")
+    if args.generation_eval_only:
+        print("Module C full dataset summary:")
+        print(json.dumps(summarize_dataset(dataset), indent=2, ensure_ascii=False))
+        print(f"Module C split file: {split_path}")
+        print("Module C validation summary:")
+        print(json.dumps(summarize_conversations(val_conversations), indent=2, ensure_ascii=False))
+        run_generation_eval_only(args=args, val_conversations=val_conversations)
+        return
     if args.dry_run:
         print_dry_run(dataset, train_conversations, val_conversations, split, split_path, args.print_examples)
         return

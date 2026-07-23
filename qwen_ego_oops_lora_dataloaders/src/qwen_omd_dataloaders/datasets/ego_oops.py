@@ -17,6 +17,20 @@ from ..schema import Segment, TrainingExample, VideoRecord, WindowSpec
 from ..time_tokens import render_seconds_span_target
 from ..video import video_duration_seconds
 
+EXTRA_STEP_INSTRUCTION = "undefined / extra step"
+
+TASK_DESCRIPTIONS: dict[str, str] = {
+    "blacklight": "ionic reaction / fluorescence experiment with highlighters, detergent, and a black light",
+    "cardboard": "cardboard box crafting procedure (cutting, folding, gluing, assembling)",
+    "electronics": "electronics circuit assembly with battery box, switches, motor, and lamp",
+    "ion": "metal ion reactivity experiment on a microplate with copper, zinc, and magnesium",
+    "tsumiki": "block stacking (tsumiki) assembly with colored cubes and prisms",
+}
+
+MODULE_A_STEP_ID_NONE_LETTER = "A"
+MODULE_A_STEP_ID_EXTRA_LETTER = "B"
+MODULE_A_STEP_ID_FIRST_INSTRUCTION_LETTER = "C"
+
 
 class EgoOopsProvider:
     """Normalize EgoOops metadata into records shared by all module datasets."""
@@ -86,7 +100,7 @@ class EgoOopsProvider:
         is_mistake = instruction_index == -1 or bool(labels)
         label_names = [self._label_name(label) for label in labels]
         if instruction_index == -1:
-            instruction = "undefined / extra mistake action"
+            instruction = EXTRA_STEP_INSTRUCTION
         elif 0 <= instruction_index < len(instructions):
             instruction = instructions[instruction_index]
         else:
@@ -109,6 +123,39 @@ class EgoOopsProvider:
         return str(label)
 
 
+def task_description(task_id: str) -> str:
+    return TASK_DESCRIPTIONS.get(task_id, f"procedural task '{task_id}'")
+
+
+def module_a_step_id_letter_for_instruction_index(instruction_index: int) -> str:
+    if instruction_index < 0:
+        return MODULE_A_STEP_ID_EXTRA_LETTER
+    return chr(ord(MODULE_A_STEP_ID_FIRST_INSTRUCTION_LETTER) + instruction_index)
+
+
+def module_a_instruction_for_step_id_letter(
+    letter: str,
+    instructions: list[str] | tuple[str, ...],
+) -> str | None:
+    normalized = letter.strip().upper()[:1]
+    if not normalized or not ("A" <= normalized <= "Z"):
+        return None
+    if normalized == MODULE_A_STEP_ID_NONE_LETTER:
+        return None
+    if normalized == MODULE_A_STEP_ID_EXTRA_LETTER:
+        return EXTRA_STEP_INSTRUCTION
+    index = ord(normalized) - ord(MODULE_A_STEP_ID_FIRST_INSTRUCTION_LETTER)
+    if 0 <= index < len(instructions):
+        return instructions[index]
+    return None
+
+
+def is_module_a_completion_label(label: str, *, label_mode: str) -> bool:
+    if label_mode == "legacy":
+        return label.strip().upper() == "COMPLETE"
+    return label.strip().upper()[:1] not in ("", MODULE_A_STEP_ID_NONE_LETTER)
+
+
 def _module_a_prompt(
     *,
     completed_steps: Iterable[str],
@@ -123,6 +170,46 @@ def _module_a_prompt(
         f"{json.dumps(list(pending_steps), ensure_ascii=False)}\n"
         "Status?"
     )
+
+
+def _module_a_step_id_prompt(
+    *,
+    task_id: str,
+    instructions: Iterable[str],
+    completed_steps: Iterable[str],
+    mistake_classes: Iterable[str],
+) -> str:
+    instruction_list = list(instructions)
+    completed = list(completed_steps)
+    lines = [
+        (
+            f'In the following video, the person is doing a task called: "{task_id}". '
+            f"Description of the task: {task_description(task_id)}."
+        ),
+    ]
+    if completed:
+        lines.append("The following steps were already done:")
+        lines.extend(f"- {step}" for step in completed)
+    else:
+        lines.append("No steps were done yet.")
+    lines.append(
+        "You need to identify which of the instruction steps is being attempted. "
+        "Take into consideration that mistakes can be done such as:"
+    )
+    lines.extend(f"- {name}" for name in mistake_classes)
+    lines.append(
+        "Also consider extra steps not in the formal directions. "
+        "Which of the following steps is the person best likely just finished attempting "
+        "from what is visible in the clip?"
+    )
+    lines.append(f"{MODULE_A_STEP_ID_NONE_LETTER}. NONE - no step was completed / truncated step")
+    lines.append(
+        f"{MODULE_A_STEP_ID_EXTRA_LETTER}. EXTRA - a completed extra step not in the list below"
+    )
+    for index, instruction in enumerate(instruction_list):
+        letter = module_a_step_id_letter_for_instruction_index(index)
+        lines.append(f"{letter}. {instruction}")
+    return "\n".join(lines)
 
 
 def _module_b_prompt(instruction: str) -> str:
@@ -157,6 +244,12 @@ def _procedural_segments(record: VideoRecord) -> list[Segment]:
     ]
 
 
+def _module_a_attempt_segments(record: VideoRecord, *, label_mode: str) -> list[Segment]:
+    if label_mode == "legacy":
+        return _procedural_segments(record)
+    return [segment for segment in record.segments if segment.duration >= 0.5]
+
+
 def build_module_a_windows(
     records: Iterable[VideoRecord],
     *,
@@ -164,6 +257,7 @@ def build_module_a_windows(
 ) -> list[WindowSpec]:
     rng = random.Random(config.seed)
     all_windows: list[WindowSpec] = []
+    label_mode = config.label_mode
 
     for record in records:
         video_duration = video_duration_seconds(record.video_path)
@@ -172,11 +266,11 @@ def build_module_a_windows(
 
         completed: list[str] = []
         pending_waits: list[WindowSpec] = []
-        positives = 0
         last_reset_time = 0.0
+        all_instructions = tuple(record.instructions)
+        attempts = _module_a_attempt_segments(record, label_mode=label_mode)
 
-        procedural = _procedural_segments(record)
-        for step_order, segment in enumerate(procedural):
+        for step_order, segment in enumerate(attempts):
             buffer_start = max(0.0, last_reset_time)
             current_time = min(video_duration, buffer_start + config.stride_seconds)
             completion_deadline = min(
@@ -184,19 +278,34 @@ def build_module_a_windows(
                 segment.end + segment.duration * config.completion_margin,
             )
 
-            pending = tuple(
-                item.instruction
-                for item in procedural[step_order + 1 :]
-            )
+            if label_mode == "legacy":
+                pending = tuple(item.instruction for item in attempts[step_order + 1 :])
+                incomplete_label = "WAIT"
+                complete_label = "COMPLETE"
+                current_step = segment.instruction
+            else:
+                pending = tuple(
+                    item.instruction
+                    for item in attempts[step_order + 1 :]
+                    if item.instruction_index >= 0
+                )
+                incomplete_label = MODULE_A_STEP_ID_NONE_LETTER
+                complete_label = module_a_step_id_letter_for_instruction_index(segment.instruction_index)
+                current_step = (
+                    EXTRA_STEP_INSTRUCTION
+                    if segment.instruction_index < 0
+                    else segment.instruction
+                )
 
+            emitted_complete = False
             while current_time < completion_deadline:
-                label = "WAIT" if current_time < segment.end else "COMPLETE"
+                label = incomplete_label if current_time < segment.end else complete_label
                 window = WindowSpec(
                     video_path=record.video_path,
                     video_id=record.video_id,
                     task_id=record.task_id,
                     step_index=segment.instruction_index,
-                    current_step=segment.instruction,
+                    current_step=current_step,
                     window_start=buffer_start,
                     window_end=current_time,
                     gt_start=segment.start,
@@ -204,8 +313,10 @@ def build_module_a_windows(
                     label=label,
                     completed_steps=tuple(completed),
                     pending_steps=pending,
+                    all_instructions=all_instructions,
+                    label_mode=label_mode,
                 )
-                if label == "WAIT":
+                if label == incomplete_label:
                     pending_waits.append(window)
                     current_time += config.stride_seconds
                     continue
@@ -217,27 +328,30 @@ def build_module_a_windows(
                     keep_last=config.keep_last_wait_windows,
                 ))
                 all_windows.append(window)
-                positives += 1
                 pending_waits = []
-                completed.append(segment.instruction)
+                if segment.instruction_index >= 0:
+                    completed.append(segment.instruction)
                 last_reset_time = segment.end
+                emitted_complete = True
                 break
 
-            else:
+            if not emitted_complete:
                 complete_time = min(video_duration, max(segment.end, current_time))
                 window = WindowSpec(
                     video_path=record.video_path,
                     video_id=record.video_id,
                     task_id=record.task_id,
                     step_index=segment.instruction_index,
-                    current_step=segment.instruction,
+                    current_step=current_step,
                     window_start=buffer_start,
                     window_end=complete_time,
                     gt_start=segment.start,
                     gt_end=segment.end,
-                    label="COMPLETE",
+                    label=complete_label,
                     completed_steps=tuple(completed),
                     pending_steps=pending,
+                    all_instructions=all_instructions,
+                    label_mode=label_mode,
                 )
                 all_windows.extend(_downsample_waits(
                     pending_waits,
@@ -246,9 +360,9 @@ def build_module_a_windows(
                     keep_last=config.keep_last_wait_windows,
                 ))
                 all_windows.append(window)
-                positives += 1
                 pending_waits = []
-                completed.append(segment.instruction)
+                if segment.instruction_index >= 0:
+                    completed.append(segment.instruction)
                 last_reset_time = segment.end
 
     return all_windows
@@ -277,6 +391,8 @@ def _downsample_waits(
 class EgoOopsModuleADataset(Dataset):
     def __init__(self, provider: EgoOopsProvider, config: ModuleAConfig | None = None) -> None:
         self.config = config or ModuleAConfig()
+        self.provider = provider
+        self.mistake_classes = list(provider.mistake_classes)
         self.records = list(provider.iter_video_records())
         self.windows = build_module_a_windows(self.records, config=self.config)
         self.examples = [self._window_to_example(window) for window in self.windows]
@@ -287,13 +403,20 @@ class EgoOopsModuleADataset(Dataset):
     def __getitem__(self, index: int) -> TrainingExample:
         return self.examples[index]
 
-    @staticmethod
-    def _window_to_example(window: WindowSpec) -> TrainingExample:
-        prompt = _module_a_prompt(
-            completed_steps=window.completed_steps,
-            current_step=window.current_step,
-            pending_steps=window.pending_steps,
-        )
+    def _window_to_example(self, window: WindowSpec) -> TrainingExample:
+        if window.label_mode == "step_id":
+            prompt = _module_a_step_id_prompt(
+                task_id=window.task_id,
+                instructions=window.all_instructions or (),
+                completed_steps=window.completed_steps,
+                mistake_classes=self.mistake_classes,
+            )
+        else:
+            prompt = _module_a_prompt(
+                completed_steps=window.completed_steps,
+                current_step=window.current_step,
+                pending_steps=window.pending_steps,
+            )
         return TrainingExample(
             module="A",
             source_dataset="ego_oops",
@@ -312,6 +435,9 @@ class EgoOopsModuleADataset(Dataset):
                 "completed_steps": list(window.completed_steps),
                 "current_step": window.current_step,
                 "pending_steps": list(window.pending_steps),
+                "all_instructions": list(window.all_instructions),
+                "label_mode": window.label_mode,
+                "mistake_classes": list(self.mistake_classes),
             },
         )
 
@@ -324,7 +450,16 @@ class EgoOopsModuleBDataset(Dataset):
         config: ModuleBConfig | None = None,
         time_config: TimeTokenConfig | None = None,
     ) -> None:
-        self.module_a_config = module_a_config or ModuleAConfig()
+        base = module_a_config or ModuleAConfig()
+        # Module B localizes GT procedural attempts; keep legacy COMPLETE windows.
+        self.module_a_config = ModuleAConfig(
+            stride_seconds=base.stride_seconds,
+            completion_margin=base.completion_margin,
+            negative_to_positive_ratio=base.negative_to_positive_ratio,
+            keep_last_wait_windows=base.keep_last_wait_windows,
+            seed=base.seed,
+            label_mode="legacy",
+        )
         self.config = config or ModuleBConfig()
         self.time_config = time_config or TimeTokenConfig()
         self.records = list(provider.iter_video_records())
@@ -508,7 +643,7 @@ def _reasoning_for_segment(segment: Segment) -> str:
             return segment.caption
         if segment.error_label:
             return f"The execution deviates from the instruction and is labeled as {segment.error_label}."
-        return "The segment is labeled as an undefined or extra mistake action."
+        return "The segment is labeled as an undefined or extra step."
     return "The observed action follows the instructed step without a visible procedural deviation."
 
 

@@ -103,7 +103,12 @@ def main() -> None:
 
 
 def validate_example(module: str, target: str) -> None:
-    if module == "A" and target not in {"WAIT", "COMPLETE"}:
+    if module == "A":
+        normalized = target.strip().upper()
+        if normalized in {"WAIT", "COMPLETE"}:
+            return
+        if len(normalized) == 1 and "A" <= normalized <= "Z":
+            return
         raise SystemExit(f"Invalid Module A target: {target}")
     if module == "B":
         parsed = json.loads(target)
